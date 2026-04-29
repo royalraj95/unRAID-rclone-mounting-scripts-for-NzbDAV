@@ -40,6 +40,7 @@ LOCK_DIR="/mnt/user/appdata/other/scripts/running"
 # --------------------------------------------------------------------------------------
 # 2. MAIN SCRIPT - DO NOT EDIT ANYTHING UNDER HERE. YOU WERE WARNED!!!
 # --------------------------------------------------------------------------------------
+
 mkdir -p "$(dirname "$LOG_FILE")"
 
 log_step() { 
