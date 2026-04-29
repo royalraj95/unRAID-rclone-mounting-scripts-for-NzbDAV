@@ -48,7 +48,7 @@ log_step() {
     echo "[$(date '+%H:%M:%S')] INFO: $MSG" | tee -a "$LOG_FILE"
 }
 
-echo "--- COMMENCING CLEAN ARRAY SHUTDOWN ---" | tee -a "$LOG_FILE"
+echo "--- COMMENCING CLEAN ARRAY SHUTDOWN (v7.4 SYNC) ---" | tee -a "$LOG_FILE"
 
 # --- STAGE 1: STOP DOCKERS ---
 if [ -n "$PG_CONTAINER" ]; then
@@ -100,7 +100,7 @@ log_step "SUCCESS: Lock files purged. Environment clear for shutdown."
 /usr/local/emhttp/webGui/scripts/notify \
     -e "Server Status" \
     -s "Shutdown Prepared" \
-    -d "Binds, Bridges, and ZFS Pools cleared cleanly." \
+    -d "v7.4 Binds, Bridges, and ZFS Pools cleared cleanly." \
     -i "normal"
 
 echo "--- JANITOR WORK COMPLETE ---" | tee -a "$LOG_FILE"
