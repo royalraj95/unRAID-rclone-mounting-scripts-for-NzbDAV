@@ -1,0 +1,196 @@
+#!/bin/bash
+# ======================================================================================
+# SCRIPT: Rclone Heartbeat & Intelligent Priming
+# VERSION: v1.0-RC1
+# DESCRIPTION: Monitors Rclone mounts and performs "Smart Priming" (Newest first,
+#              then historical debt). Hardened for portability.
+# ======================================================================================
+
+# --------------------------------------------------------------------------------------
+# 1. USER CONFIGURATION
+# --------------------------------------------------------------------------------------
+
+# --- SCRIPT SETTINGS ---
+HARD_RESET="N"   																			                        # Y/N. A Hard reset stops rclone and removes as many traces as possible so that it will remount on next run. Also stops dockers
+MAX_LOAD="60"                																                  # Stop mount and run a force reset if the Server load exceeds this
+MAX_FAILURES="1"             																                  # How many times to allow the mount check to fail before automatically applying a Hard Reset to try and Fix
+PRIME_MAX_TIME="300"         																                  # Pre-fills --dir-cache to optimise start times and arr activity. Set Time to spend priming the --dir-cache on each run. Runs will always check for newest files first, and then resume priming older files not yet indexed
+STATE_FILE="/mnt/user/appdata/nzbdav_heartbeat/prime_state.db"				        # Keeps track of what files have been indexed
+LOG_PATH="/mnt/user/appdata/logs/rclone_mount.log"
+
+# --- REQUIRED SETTINGS ---
+REMOTE_NAME="nzb-dav:"                  													            # Rclone remote name including colon
+RCLONE_CONF="/boot/config/plugins/rclone/.rclone.conf"
+MOUNT_PATH="/mnt/computers/streaming/nzbdav"												          # full path to where remote should be mounted
+VFS_CACHE_DIR="/mnt/computers/streaming/cache/nzbdav"									        # Path for rclone cache files
+LOCAL_MEDIA_PATH="/mnt/computers/streaming/media" 										        # Where your media is stored
+
+VFS_MODE="writes"																			                        # --vfs-cache-mode mode. I use writes instead of full, as I have a 1Gbps line and lots of memory so I don't want unnecessary disk writes and just use my RAM 
+CHUNK_START="32M"																			                        # --vfs-read-chunk-size. 32M gives me superfast launches on 1Gbps. Experiment for your setup/tastes
+CHUNK_LIMIT="2G"																			                        # --vfs-read-chunk-size-limit. Largest chunk requested and is stored in RAM and/or disk. Experiment for your setup/tastes
+STREAMS="0"                  																                  # --vfs-read-chunk-streams. I have disabled as drives unnecessary IO on system as nzbdav has already retrieved chunk. Experiment for your setup/tastes
+RAM_BUFFER="256M"            																                  # --buffer-size RAM buffer. Experiment for your setup/tastes
+TRANSFERS="8"                																                  # --transfers. Aggressive attribute fetching. Experiment for your setup/tastes
+CACHE_TIME="2000h"																			                      # --dir-cache-time s m h d. If RC is setup in NzbDAV this can be high
+ATTR_TIME="2000h"																			                        # --attr-timeout s m d h. High number will help speedup arr and Plex scans
+
+# --- OPTIONAL MOUNT SETTINGS (Leave as "" to disable) ---
+DECYPH_PATH="/mnt/computers/streaming/decypharr" 											        # Location of your Decypharr mount
+RC_IP="0.0.0.0"                         													            # Recommend leave as 0.0.0.0
+RC_PORT="5572"                          
+RC_USER="Username"   
+RC_PASS="Password"
+CPU_PIN="8,9,10,11,24,25,26,27"																                # Control which cores rclone uses
+
+# --- DOCKER SETTINGS ---
+POSTGRES_CONTAINER="postgresql16"       													            # I have moved my arr databases to postgresql for speed. Use "" if don't use
+ENABLERS="postgresql16 Decypharr byparr prowlarr NzbDAV"							        # Dockers to start first that Worker dockers rely on
+CONSUMERS="Seerr emby plex bookshelf"														              # Dockers that just need the mount to be active
+WORKERS="bookshelf sonarr radarr lidarr tautulli Wizarr Kometa Sportarr" 			# Dockers that need the mount active and the Enabler Dockers up
+
+# --------------------------------------------------------------------------------------
+# 2. MAIN SCRIPT - DO NOT EDIT ANYTHING UNDER HERE. YOU WERE WARNED!!!
+# --------------------------------------------------------------------------------------
+mkdir -p "$(dirname "$STATE_FILE")"                                                         
+mkdir -p "$(dirname "$LOG_PATH")"                                                           
+LOCK_DIR="/var/run"
+log_step() { echo "[$(date '+%H:%M:%S')] $1"; }                                              
+notify() { /usr/local/emhttp/webGui/scripts/notify -i "$1" -s "Heartbeat Alert" -d "$2"; }   
+
+# --- STAGE 1: LOAD CHECK ---
+log_step "VERIFYING: System environment and load..."
+CURRENT_LOAD=$(cat /proc/loadavg | awk '{print $1}' | cut -d. -f1)
+if [ "$CURRENT_LOAD" -gt "$MAX_LOAD" ]; then                                                
+    log_step "[CRITICAL] Load is $CURRENT_LOAD. Performing emergency cleanup..."
+    ps aux | grep "rclone mount $REMOTE_NAME" | grep -v grep | awk '{print $2}' | xargs kill -9 > /dev/null 2>&1
+    umount -l "$MOUNT_PATH" > /dev/null 2>&1
+    notify "warning" "Heartbeat aborted: System Load ($CURRENT_LOAD) is too high."
+    exit 1                                                                                  
+fi
+
+# Lockfile prevention
+EXISTING_LOCK=$(ls $LOCK_DIR/heartbeat_*.lock 2>/dev/null | head -n 1)
+if [ -n "$EXISTING_LOCK" ]; then
+    LOCK_PID=$(basename "$EXISTING_LOCK" | cut -d'_' -f2 | cut -d'.' -f1)
+    if ! ps -p "$LOCK_PID" > /dev/null 2>&1 || [[ "$HARD_RESET" == "Y" ]]; then
+        log_step "CLEANUP: Removing stale lock file..."
+        rm -f "$EXISTING_LOCK"
+    else
+        exit 0
+    fi
+fi
+
+NEW_LOCK_FILE="$LOCK_DIR/heartbeat_$$.lock"
+touch "$NEW_LOCK_FILE"
+trap 'rm -f "$NEW_LOCK_FILE"' EXIT
+
+# --- STAGE 2: DUAL MOUNT VALIDATION ---
+[ -f "$STATE_FILE" ] && source "$STATE_FILE"
+CUR_FAIL=${FAIL_COUNT:-0}
+
+log_step "CHECKING: Mount integrity (Dual-Tier Probe)..."
+MOUNT_ALIVE=true
+
+if ! timeout 5s [ -d "$VALIDATION_SUBFOLDER" ]; then
+    MOUNT_ALIVE=false
+    log_step "[!] ALERT: Primary validation folder missing or disconnected."
+else
+    log_step "SUCCESS: Primary mount structure verified."
+fi
+
+if [ -n "$DECYPH_PATH" ]; then
+    if ! timeout 5s [ -f "$DECYPH_VALIDATION" ]; then
+        MOUNT_ALIVE=false
+        log_step "[!] ALERT: Decypharr validation file missing."
+    else
+        log_step "SUCCESS: Decypharr mount structure verified."
+    fi
+fi
+
+# Reset Logic
+if [[ "$HARD_RESET" == "Y" ]]; then
+    TRIGGER_RESET=true
+elif [[ "$MOUNT_ALIVE" == "false" && "$CUR_FAIL" -ge "$MAX_FAILURES" ]]; then
+    notify "warning" "Mount check failed. Triggering automatic rebuild."
+    TRIGGER_RESET=true
+else
+    TRIGGER_RESET=false
+fi
+
+if [[ "$TRIGGER_RESET" == "true" ]]; then
+    log_step "RESET: Stopping services and clearing mounts..."
+    for container in $WORKERS $CONSUMERS $ENABLERS; do docker stop "$container" > /dev/null 2>&1; done
+    killall -9 rclone > /dev/null 2>&1
+    [ -n "$RC_PORT" ] && fuser -k "$RC_PORT/tcp" > /dev/null 2>&1                           
+    umount -l "$MOUNT_PATH" > /dev/null 2>&1
+    [ -n "$DECYPH_PATH" ] && umount -l "$DECYPH_PATH" > /dev/null 2>&1
+    rm -rf "$VFS_CACHE_DIR/vfsMeta"                                                         
+    rm -f "$STATE_FILE"
+fi
+
+# --- STAGE 3: RECONSTRUCTION ---
+if [[ "$MOUNT_ALIVE" == "false" ]] || [[ "$TRIGGER_RESET" == "true" ]]; then                                           
+    log_step "REBUILD: Starting Rclone..." 
+    umount -l "$MOUNT_PATH" > /dev/null 2>&1
+    [ -n "$DECYPH_PATH" ] && umount -l "$DECYPH_PATH" > /dev/null 2>&1
+    
+    for engine in $ENABLERS; do [ "$(docker inspect -f '{{.State.Running}}' "$engine" 2>/dev/null)" != "true" ] && docker start "$engine" > /dev/null 2>&1; done
+    
+    RC_ARGS=""
+    [ -n "$RC_PORT" ] && RC_ARGS="--rc --rc-addr ${RC_IP:-"127.0.0.1"}:$RC_PORT --rc-user ${RC_USER:-"admin"} --rc-pass ${RC_PASS:-"admin"}"
+    LAUNCHER=""
+    [ -n "$CPU_PIN" ] && LAUNCHER="taskset -c $CPU_PIN"
+
+    nohup $LAUNCHER rclone mount "$REMOTE_NAME" "$MOUNT_PATH" \
+      --config "$RCLONE_CONF" --vfs-cache-mode "$VFS_MODE" --cache-dir "$VFS_CACHE_DIR" \
+      --buffer-size "$RAM_BUFFER" --vfs-read-chunk-size "$CHUNK_START" --vfs-read-chunk-size-limit "$CHUNK_LIMIT" \
+      --vfs-read-chunk-streams "$STREAMS" --transfers "$TRANSFERS" --dir-cache-time "$CACHE_TIME" --attr-timeout "$ATTR_TIME" \
+      --no-modtime --no-checksum --async-read --links --use-cookies --allow-other \
+      $RC_ARGS --log-level INFO --log-file "$LOG_PATH" > /dev/null 2>&1 &                   
+    disown $!
+
+    COUNT=0; while ! timeout 2s [ -d "$VALIDATION_SUBFOLDER" ] && [ $COUNT -lt 15 ]; do sleep 2; ((COUNT++)); done 
+    if ! timeout 2s [ -d "$VALIDATION_SUBFOLDER" ]; then                                       
+        notify "alert" "Rclone mount failed to rebuild."
+        sed -i '/FAIL_COUNT=/d' "$STATE_FILE" 2>/dev/null; echo "FAIL_COUNT=$((CUR_FAIL + 1))" >> "$STATE_FILE"                                
+        exit 1
+    fi
+fi
+
+# --- STAGE 4: PRIMING ---
+log_step "INITIATING: Library Priming..."
+if timeout 2s [ -d "$VALIDATION_SUBFOLDER" ]; then                                             
+    [ -f "$STATE_FILE" ] && source "$STATE_FILE"
+    START_TIME=$(date +%s); LAST_RUN_TS=${LAST_PRIMED_TS:-0}; TOTAL_KNOWN=${TOTAL_INDEXED:-0}
+    NEW_FILES=$(find "$LOCAL_MEDIA_PATH" -type l -newermt "@$LAST_RUN_TS" -exec ls -d {} + 2>/dev/null | wc -l)
+    TOTAL_KNOWN=$((TOTAL_KNOWN + NEW_FILES))
+    
+    if [[ "$ALL_HISTORICAL_PRIMED" != "TRUE" ]]; then                                       
+        [ -z "$TOTAL_DEBT" ] && TOTAL_DEBT=$(find "$LOCAL_MEDIA_PATH" -type l | wc -l)
+        mapfile -t TARGETS < <(find "$LOCAL_MEDIA_PATH" -type l -not -newermt "@${HISTORICAL_MARKER:-$(date +%s)}" -printf "%T@ %p\n" | sort -rn | cut -d' ' -f2-)
+        LOCAL_PRIMED=0; NEW_MARKER=${HISTORICAL_MARKER:-$(date +%s)}                        
+        for file in "${TARGETS[@]}"; do                                                     
+            ls -d "$file" > /dev/null 2>&1; ((LOCAL_PRIMED++))                               
+            NEW_MARKER=$(stat -c %Y "$file")
+            [ $(( $(date +%s) - START_TIME )) -ge "$PRIME_MAX_TIME" ] && break
+        done
+        sed -i '/TOTAL_DEBT=/d;/HISTORICAL_MARKER=/d;/ALL_HISTORICAL_PRIMED=/d' "$STATE_FILE" 2>/dev/null
+        if [ ${#TARGETS[@]} -le $LOCAL_PRIMED ]; then echo "ALL_HISTORICAL_PRIMED=TRUE" >> "$STATE_FILE"
+        else echo "TOTAL_DEBT=$TOTAL_DEBT" >> "$STATE_FILE"; echo "HISTORICAL_MARKER=$NEW_MARKER" >> "$STATE_FILE"; echo "ALL_HISTORICAL_PRIMED=FALSE" >> "$STATE_FILE"; fi                                                                                  
+    fi
+    sed -i '/LAST_PRIMED_TS=/d;/TOTAL_INDEXED=/d' "$STATE_FILE" 2>/dev/null
+    { echo "LAST_PRIMED_TS=$(date +%s)"; echo "TOTAL_INDEXED=$TOTAL_KNOWN"; } >> "$STATE_FILE" 
+fi
+
+# --- STAGE 5: STARTUP ---
+log_step "STARTING: Services..."
+for engine in $ENABLERS; do [ "$(docker inspect -f '{{.State.Running}}' "$engine" 2>/dev/null)" != "true" ] && docker start "$engine" > /dev/null 2>&1; done
+for container in $CONSUMERS; do [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" != "true" ] && docker start "$container" > /dev/null 2>&1; done
+
+if [ -n "$POSTGRES_CONTAINER" ]; then                                                       
+    PG_PORT=$(docker port "$POSTGRES_CONTAINER" 5432 2>/dev/null | cut -d':' -f2)
+    while ! timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/${PG_PORT:-5432}" 2>/dev/null; do sleep 2; done                                                                                    
+fi
+for container in $WORKERS; do [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" != "true" ] && docker start "$container" > /dev/null 2>&1; done
+log_step "LOAD: $(cat /proc/loadavg | awk '{print $1}') | STATUS: All Systems Green."
+exit 0
