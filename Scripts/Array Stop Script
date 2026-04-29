@@ -1,7 +1,7 @@
 #!/bin/bash
 # ======================================================================================
 # SCRIPT: The Janitor (Array Shutdown Orchestrator)
-# VERSION: v1.0-RC1 (Public Release Candidate)
+# VERSION: v1.0-RC2 (Public Release Candidate)
 # DESCRIPTION: Ensures a clean Unraid shutdown by flushing databases, unmounting 
 #              complex bind-mounts, terminating Rclone, and exporting ZFS pools.
 # ======================================================================================
@@ -34,8 +34,8 @@ BINDS=(
 ZFS_POOLS=("cache" "computers")																							                                               # Pools to export to prevent "pool busy" hangs during reboot. Leave () empty to skip.
 
 # --- SCRIPT SETTINGS ---
-LOG_FILE="/mnt/user/appdata/other/logs/nzbdav/shutdown.log"
-LOCK_DIR="/mnt/user/appdata/other/scripts/running"
+LOG_FILE="/mnt/user/appdata/other/scripts/nzbdav/shutdown.log"
+LOCK_DIR="/mnt/user/appdata/other/scripts/nzbdav"
 
 # --------------------------------------------------------------------------------------
 # 2. MAIN SCRIPT - DO NOT EDIT ANYTHING UNDER HERE. YOU WERE WARNED!!!
@@ -94,7 +94,8 @@ fi
 # --- STAGE 6: CLEANUP & NOTIFY ---
 log_step "Purging script lock files..."
 rm -f "$LOCK_DIR"/janitor_*.lock
-rm -f "$LOCK_DIR"/heartbeat_*.lock
+rm -f "$LOCK_DIR/heartbeat_"*.lock
+rm -f "$LOCK_DIR/prime_session.lock"
 log_step "SUCCESS: Lock files purged. Environment clear for shutdown."
 
 /usr/local/emhttp/webGui/scripts/notify \
