@@ -1,0 +1,106 @@
+#!/bin/bash
+# ======================================================================================
+# SCRIPT: The Janitor (Array Shutdown Orchestrator)
+# VERSION: v1.0-RC1 (Public Release Candidate)
+# DESCRIPTION: Ensures a clean Unraid shutdown by flushing databases, unmounting 
+#              complex bind-mounts, terminating Rclone, and exporting ZFS pools.
+# ======================================================================================
+
+# --------------------------------------------------------------------------------------
+# 1. USER CONFIGURATION
+# --------------------------------------------------------------------------------------
+
+# --- DATABASE SETTINGS ---
+
+PG_CONTAINER="postgresql16" 																							                                                      # Name of your Postgres container. Leave as "" if not using Postgres											
+PG_FLUSH_TIME="60"          																							                                                      # Seconds to allow for buffer flushing
+
+# --- MOUNT & BRIDGE SETTINGS ---
+# Rclone Remote Control port to clear
+RC_PORT="5572"
+
+# --- Cloud/FUSE mount paths to force unmount ---																		                                             # Unmounts to make sure doesn't impact array stop. Leave as "" if not using
+CLOUD_MOUNTS=(
+    "/mnt/computers/streaming/nzbdav"
+    "/mnt/computers/streaming/decypharr"
+)
+
+# --- LOCAL BIND BRIDGES ---																							                                                        # Unmounts to make sure doesn't impact array stop. Leave as "" if not using
+BINDS=(
+    "/mnt/cache/appdata/dockers/plex/Library/Application Support/Plex Media Server/Cache/Transcode/Sync+"
+    )
+
+# --- ZFS STORAGE ---
+ZFS_POOLS=("cache" "computers")																							                                                      # Pools to export to prevent "pool busy" hangs during reboot. Leave () empty to skip.
+
+# --- SCRIPT SETTINGS ---
+LOG_FILE="/mnt/user/appdata/other/logs/nzbdav/shutdown.log"
+LOCK_DIR="/mnt/user/appdata/other/scripts/running"
+
+# --------------------------------------------------------------------------------------
+# 2. MAIN SCRIPT - DO NOT EDIT ANYTHING UNDER HERE. YOU WERE WARNED!!!
+# --------------------------------------------------------------------------------------
+mkdir -p "$(dirname "$LOG_FILE")"
+
+log_step() { 
+    local MSG="$1"
+    echo "[$(date '+%H:%M:%S')] INFO: $MSG" | tee -a "$LOG_FILE"
+}
+
+echo "--- COMMENCING CLEAN ARRAY SHUTDOWN ---" | tee -a "$LOG_FILE"
+
+# --- STAGE 1: STOP DOCKERS ---
+if [ -n "$PG_CONTAINER" ]; then
+    log_step "Signaling $PG_CONTAINER to flush and stop ($PG_FLUSH_TIME seconds)..."
+    docker stop -t "$PG_FLUSH_TIME" "$PG_CONTAINER" > /dev/null 2>&1
+    log_step "SUCCESS: Database flush and stop complete."
+fi
+
+log_step "Stopping all remaining containers..."
+docker stop $(docker ps -q) > /dev/null 2>&1
+log_step "SUCCESS: All remaining Docker containers stopped."
+
+# --- STAGE 2: BIND BRIDGES ---
+log_step "Unmounting local bind bridges..."
+for mount in "${BINDS[@]}"; do
+    if umount -l "$mount" > /dev/null 2>&1; then
+        log_step "SUCCESS: Unmounted bind bridge: $mount"
+    fi
+done
+
+# --- STAGE 3: TERMINATE RCLONE ---
+log_step "Terminating Rclone and clearing Port $RC_PORT..."
+killall -9 rclone > /dev/null 2>&1
+fuser -k "$RC_PORT/tcp" > /dev/null 2>&1
+
+# --- STAGE 4: FORCE CLOUD UNMOUNTS ---
+log_step "Forcing lazy unmount of cloud paths..."
+for cloud_path in "${CLOUD_MOUNTS[@]}"; do
+    umount -l "$cloud_path" > /dev/null 2>&1
+    fusermount -uz "$cloud_path" > /dev/null 2>&1
+    log_step "SUCCESS: Forced lazy unmount of cloud path: $cloud_path"
+done
+
+# --- STAGE 5: ZFS POOL EXPORT ---
+if [ ${#ZFS_POOLS[@]} -gt 0 ]; then
+    for pool in "${ZFS_POOLS[@]}"; do
+        log_step "Exporting ZFS Pool: $pool..."
+        zpool export -f "$pool" > /dev/null 2>&1
+        log_step "SUCCESS: ZFS Pool $pool exported."
+    done
+fi
+
+# --- STAGE 6: CLEANUP & NOTIFY ---
+log_step "Purging script lock files..."
+rm -f "$LOCK_DIR"/janitor_*.lock
+rm -f "$LOCK_DIR"/heartbeat_*.lock
+log_step "SUCCESS: Lock files purged. Environment clear for shutdown."
+
+/usr/local/emhttp/webGui/scripts/notify \
+    -e "Server Status" \
+    -s "Shutdown Prepared" \
+    -d "Binds, Bridges, and ZFS Pools cleared cleanly." \
+    -i "normal"
+
+echo "--- JANITOR WORK COMPLETE ---" | tee -a "$LOG_FILE"
+exit 0
