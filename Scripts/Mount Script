@@ -165,6 +165,8 @@ if timeout 2s [ -d "$VALIDATION_SUBFOLDER" ]; then
     NEW_FILES=$(find "$LOCAL_MEDIA_PATH" -type l -newermt "@$LAST_RUN_TS" -exec ls -d {} + 2>/dev/null | wc -l)
     TOTAL_KNOWN=$((TOTAL_KNOWN + NEW_FILES))
     
+    log_step "FOUND: $NEW_FILES new files since last run. (Total indexed: $TOTAL_KNOWN)"
+
     if [[ "$ALL_HISTORICAL_PRIMED" != "TRUE" ]]; then                                       
         [ -z "$TOTAL_DEBT" ] && TOTAL_DEBT=$(find "$LOCAL_MEDIA_PATH" -type l | wc -l)
         mapfile -t TARGETS < <(find "$LOCAL_MEDIA_PATH" -type l -not -newermt "@${HISTORICAL_MARKER:-$(date +%s)}" -printf "%T@ %p\n" | sort -rn | cut -d' ' -f2-)
@@ -174,6 +176,9 @@ if timeout 2s [ -d "$VALIDATION_SUBFOLDER" ]; then
             NEW_MARKER=$(stat -c %Y "$file")
             [ $(( $(date +%s) - START_TIME )) -ge "$PRIME_MAX_TIME" ] && break
         done
+        
+        log_step "PRIMED: $LOCAL_PRIMED historical files. Remaining debt: $((TOTAL_DEBT - LOCAL_PRIMED))"
+
         sed -i '/TOTAL_DEBT=/d;/HISTORICAL_MARKER=/d;/ALL_HISTORICAL_PRIMED=/d' "$STATE_FILE" 2>/dev/null
         if [ ${#TARGETS[@]} -le $LOCAL_PRIMED ]; then echo "ALL_HISTORICAL_PRIMED=TRUE" >> "$STATE_FILE"
         else echo "TOTAL_DEBT=$TOTAL_DEBT" >> "$STATE_FILE"; echo "HISTORICAL_MARKER=$NEW_MARKER" >> "$STATE_FILE"; echo "ALL_HISTORICAL_PRIMED=FALSE" >> "$STATE_FILE"; fi                                                                                  
@@ -183,14 +188,20 @@ if timeout 2s [ -d "$VALIDATION_SUBFOLDER" ]; then
 fi
 
 # --- STAGE 5: STARTUP ---
-log_step "STARTING: Services..."
+log_step "STARTING: Enabler Docker group..."
 for engine in $ENABLERS; do [ "$(docker inspect -f '{{.State.Running}}' "$engine" 2>/dev/null)" != "true" ] && docker start "$engine" > /dev/null 2>&1; done
+
+log_step "STARTING: Consumer Docker group..."
 for container in $CONSUMERS; do [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" != "true" ] && docker start "$container" > /dev/null 2>&1; done
 
 if [ -n "$POSTGRES_CONTAINER" ]; then                                                       
+    log_step "WAITING: Verifying Postgres socket..."
     PG_PORT=$(docker port "$POSTGRES_CONTAINER" 5432 2>/dev/null | cut -d':' -f2)
     while ! timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/${PG_PORT:-5432}" 2>/dev/null; do sleep 2; done                                                                                    
 fi
+
+log_step "STARTING: Worker Docker group..."
 for container in $WORKERS; do [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" != "true" ] && docker start "$container" > /dev/null 2>&1; done
-log_step "LOAD: $(cat /proc/loadavg | awk '{print $1}') | STATUS: All Systems Green."
+
+log_step "STATUS: All Systems Green. Current Load: $(cat /proc/loadavg | awk '{print $1}')"
 exit 0
