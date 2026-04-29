@@ -95,7 +95,6 @@ fi
 log_step "Purging script lock files..."
 rm -f "$LOCK_DIR"/janitor_*.lock
 rm -f "$LOCK_DIR/heartbeat_"*.lock
-rm -f "$LOCK_DIR/prime_session.lock"
 log_step "SUCCESS: Lock files purged. Environment clear for shutdown."
 
 /usr/local/emhttp/webGui/scripts/notify \
