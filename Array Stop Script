@@ -12,8 +12,8 @@
 
 # --- DATABASE SETTINGS ---
 
-PG_CONTAINER="postgresql16" 																							                                                      # Name of your Postgres container. Leave as "" if not using Postgres											
-PG_FLUSH_TIME="60"          																							                                                      # Seconds to allow for buffer flushing
+PG_CONTAINER="postgresql16" 																							                                             # Name of your Postgres container. Leave as "" if not using Postgres											
+PG_FLUSH_TIME="60"          																							                                             # Seconds to allow for buffer flushing
 
 # --- MOUNT & BRIDGE SETTINGS ---
 # Rclone Remote Control port to clear
@@ -25,13 +25,13 @@ CLOUD_MOUNTS=(
     "/mnt/computers/streaming/decypharr"
 )
 
-# --- LOCAL BIND BRIDGES ---																							                                                        # Unmounts to make sure doesn't impact array stop. Leave as "" if not using
+# --- LOCAL BIND BRIDGES ---																							                                              # Unmounts to make sure doesn't impact array stop. Leave as "" if not using
 BINDS=(
     "/mnt/cache/appdata/dockers/plex/Library/Application Support/Plex Media Server/Cache/Transcode/Sync+"
     )
 
 # --- ZFS STORAGE ---
-ZFS_POOLS=("cache" "computers")																							                                                      # Pools to export to prevent "pool busy" hangs during reboot. Leave () empty to skip.
+ZFS_POOLS=("cache" "computers")																							                                               # Pools to export to prevent "pool busy" hangs during reboot. Leave () empty to skip.
 
 # --- SCRIPT SETTINGS ---
 LOG_FILE="/mnt/user/appdata/other/logs/nzbdav/shutdown.log"
