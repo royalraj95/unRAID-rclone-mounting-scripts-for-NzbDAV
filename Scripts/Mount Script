@@ -15,8 +15,8 @@ HARD_RESET="N"   																			                      # Y/N. A Hard reset st
 MAX_LOAD="60"                																                      # Stop mount and run a force reset if the Server load exceeds this
 MAX_FAILURES="1"             																                      # How many times to allow the mount check to fail before automatically applying a Hard Reset to try and Fix
 PRIME_MAX_TIME="300"         																                      # Pre-fills --dir-cache to optimise start times and arr activity. Set Time to spend priming the --dir-cache on each run. Runs will always check for newest files first, and then resume priming older files not yet indexed
-STATE_FILE="/mnt/user/appdata/nzbdav_heartbeat/prime_state.db"				                                      # Keeps track of what files have been indexed
-LOG_PATH="/mnt/user/appdata/logs/rclone_mount.log"
+STATE_FILE="/mnt/user/appdata/other/scripts/nzbdav/prime_state.db"				                                      # Keeps track of what files have been indexed
+LOG_FILE="/mnt/user/appdata/other/scripts/nzbdav/rclone_mount.log"
 
 # --- REQUIRED SETTINGS ---
 REMOTE_NAME="nzb-dav:"                  													                      # Rclone remote name including colon
@@ -52,7 +52,7 @@ WORKERS="bookshelf sonarr radarr lidarr tautulli Wizarr Kometa Sportarr" 			    
 # 2. MAIN SCRIPT - DO NOT EDIT ANYTHING UNDER HERE. YOU WERE WARNED!!!
 # --------------------------------------------------------------------------------------
 mkdir -p "$(dirname "$STATE_FILE")"                                                           
-mkdir -p "$(dirname "$LOG_PATH")"                                                             
+mkdir -p "$(dirname "$LOG_FILE")"                                                             
 LOCK_DIR="/var/run"
 log_step() { echo "[$(date '+%H:%M:%S')] $1"; }                                               
 notify() { /usr/local/emhttp/webGui/scripts/notify -i "$1" -s "Heartbeat Alert" -d "$2"; }   
@@ -157,7 +157,7 @@ if [[ "$MOUNT_ALIVE" == "false" ]] || [[ "$TRIGGER_RESET" == "true" ]]; then
       --buffer-size "$RAM_BUFFER" --vfs-read-chunk-size "$CHUNK_START" --vfs-read-chunk-size-limit "$CHUNK_LIMIT" \
       --vfs-read-chunk-streams "$STREAMS" --transfers "$TRANSFERS" --dir-cache-time "$CACHE_TIME" --attr-timeout "$ATTR_TIME" \
       --no-modtime --no-checksum --async-read --links --use-cookies --allow-other \
-      $RC_ARGS --log-level INFO --log-file "$LOG_PATH" > /dev/null 2>&1 &                   
+      $RC_ARGS --log-level INFO --log-file "$LOG_FILE" > /dev/null 2>&1 &                   
     disown $!
 
     COUNT=0; while ! timeout 2s [ -d "$VALIDATION_SUBFOLDER" ] && [ $COUNT -lt 15 ]; do sleep 2; ((COUNT++)); done 
