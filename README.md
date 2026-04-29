@@ -47,3 +47,5 @@ NzbDAV will grab content from your usenet providers. These scripts allow this co
 1. Download the script files as raw and create two scripts via User Scripts
 2. Set the <b>Array Stop</b> script to run at Array Stop and configure the script options in section 1 to match your server
 3. Set the <b>Heartbeat</b> script to run on a cron e.g. every 3 mins so that it can automatically remount and ensure that your data is "primed" (see features above), and configure the options in section 1 to match your server
+
+<a href="https://paypal.me/thankdzmm?locale.x=en_GB">Buy me a beer!</a>
