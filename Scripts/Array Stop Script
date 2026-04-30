@@ -1,7 +1,7 @@
 #!/bin/bash
 # ======================================================================================
 # SCRIPT: The Janitor (Array Shutdown Orchestrator)
-# VERSION: v1.0-RC2 (Public Release Candidate)
+# VERSION: v1.0-RC2.1 (Public Release Candidate)
 # DESCRIPTION: Ensures a clean Unraid shutdown by flushing databases, unmounting 
 #              complex bind-mounts, terminating Rclone, and exporting ZFS pools.
 # ======================================================================================
@@ -94,7 +94,7 @@ fi
 # --- STAGE 6: CLEANUP & NOTIFY ---
 log_step "Purging script lock files..."
 rm -f "$LOCK_DIR"/janitor_*.lock
-rm -f "$LOCK_DIR/heartbeat_"*.lock
+rm -f "$LOCK_DIR"/heartbeat_*.lock "$LOCK_DIR"/prime_state.db
 log_step "SUCCESS: Lock files purged. Environment clear for shutdown."
 
 /usr/local/emhttp/webGui/scripts/notify \
