@@ -1,7 +1,7 @@
 #!/bin/bash
 # ======================================================================================
 # SCRIPT: Rclone Heartbeat & Intelligent Priming
-# VERSION: v1.0-RC1
+# VERSION: v1.0-RC1.1
 # DESCRIPTION: Monitors Rclone mounts and performs "Smart Priming" (Newest first,
 #              then historical debt). Hardened for portability.
 # ======================================================================================
@@ -111,17 +111,10 @@ fi
 
 # Reset Logic
 if [[ "$HARD_RESET" == "Y" ]]; then
-    log_step "RESET: Manual Hard Reset requested. Stopping services and exiting..."
-    for container in $WORKERS $CONSUMERS $ENABLERS; do docker stop "$container" > /dev/null 2>&1; done
-    killall -9 rclone > /dev/null 2>&1
-    [ -n "$RC_PORT" ] && fuser -k "$RC_PORT/tcp" > /dev/null 2>&1                           
-    umount -l "$MOUNT_PATH" > /dev/null 2>&1
-    [ -n "$DECYPH_PATH" ] && umount -l "$DECYPH_PATH" > /dev/null 2>&1
-    rm -rf "$VFS_CACHE_DIR/vfsMeta"                                                         
-    rm -f "$STATE_FILE"
-    log_step "RESET COMPLETE: System purged. Re-set HARD_RESET to 'N' before next run."
-    exit 0
-elif [[ "$MOUNT_ALIVE" == "false" && "$CUR_FAIL" -ge "$MAX_FAILURES" ]]; then
+    log_step "RESET: Manual Hard Reset requested..."
+    TRIGGER_RESET=true
+elif [[ "$MOUNT_ALIVE" == "false" ]]; then
+    log_step "[!] ALERT: Mount failure detected. Triggering cleanup..."
     notify "warning" "Mount check failed. Triggering automatic rebuild."
     TRIGGER_RESET=true
 else
@@ -130,12 +123,13 @@ fi
 
 if [[ "$TRIGGER_RESET" == "true" ]]; then
     log_step "RESET: Stopping services and clearing mounts..."
-    for container in $WORKERS $CONSUMERS $ENABLERS; do docker stop "$container" > /dev/null 2>&1; done
+    # We stop WORKERS and CONSUMERS first to release file handles
+    for container in $WORKERS $CONSUMERS; do docker stop "$container" > /dev/null 2>&1; done
+    # Kill rclone and wait a beat
     killall -9 rclone > /dev/null 2>&1
-    [ -n "$RC_PORT" ] && fuser -k "$RC_PORT/tcp" > /dev/null 2>&1                           
+    sleep 2
     umount -l "$MOUNT_PATH" > /dev/null 2>&1
     [ -n "$DECYPH_PATH" ] && umount -l "$DECYPH_PATH" > /dev/null 2>&1
-    rm -rf "$VFS_CACHE_DIR/vfsMeta"                                                         
     rm -f "$STATE_FILE"
 fi
 
