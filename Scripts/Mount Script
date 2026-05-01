@@ -1,7 +1,7 @@
 #!/bin/bash
 # ======================================================================================
 # SCRIPT: Rclone Heartbeat & Intelligent Priming
-# VERSION: v1.0-RC1.1
+# VERSION: v1.0-RC1.2
 # DESCRIPTION: Monitors Rclone mounts and performs "Smart Priming" (Newest first,
 #              then historical debt). Hardened for portability.
 # ======================================================================================
@@ -93,9 +93,11 @@ DECYPH_VALIDATION="$DECYPH_PATH/version.txt"
 log_step "CHECKING: Mount integrity (Dual-Tier Probe)..."
 MOUNT_ALIVE=true
 
-if ! timeout 5s [ -d "$VALIDATION_SUBFOLDER" ]; then
+# We use 'ls' because it hits the "Transport endpoint not connected" error (107) 
+# which 'test -d' often misses in zombie states.
+if ! timeout 5s ls "$VALIDATION_SUBFOLDER" > /dev/null 2>&1; then
     MOUNT_ALIVE=false
-    log_step "[!] ALERT: Primary validation folder missing or disconnected."
+    log_step "[!] ALERT: Primary mount unreachable (Transport Endpoint Error or Timeout)."
 else
     log_step "SUCCESS: Primary mount structure verified."
 fi
@@ -111,10 +113,17 @@ fi
 
 # Reset Logic
 if [[ "$HARD_RESET" == "Y" ]]; then
-    log_step "RESET: Manual Hard Reset requested..."
-    TRIGGER_RESET=true
-elif [[ "$MOUNT_ALIVE" == "false" ]]; then
-    log_step "[!] ALERT: Mount failure detected. Triggering cleanup..."
+    log_step "RESET: Manual Hard Reset requested. Stopping services and exiting..."
+    for container in $WORKERS $CONSUMERS $ENABLERS; do docker stop "$container" > /dev/null 2>&1; done
+    killall -9 rclone > /dev/null 2>&1
+    [ -n "$RC_PORT" ] && fuser -k "$RC_PORT/tcp" > /dev/null 2>&1                           
+    umount -l "$MOUNT_PATH" > /dev/null 2>&1
+    [ -n "$DECYPH_PATH" ] && umount -l "$DECYPH_PATH" > /dev/null 2>&1
+    rm -rf "$VFS_CACHE_DIR/vfsMeta"                                                         
+    rm -f "$STATE_FILE"
+    log_step "RESET COMPLETE: System purged. Re-set HARD_RESET to 'N' before next run."
+    exit 0
+elif [[ "$MOUNT_ALIVE" == "false" && "$CUR_FAIL" -ge "$MAX_FAILURES" ]]; then
     notify "warning" "Mount check failed. Triggering automatic rebuild."
     TRIGGER_RESET=true
 else
@@ -123,13 +132,12 @@ fi
 
 if [[ "$TRIGGER_RESET" == "true" ]]; then
     log_step "RESET: Stopping services and clearing mounts..."
-    # We stop WORKERS and CONSUMERS first to release file handles
-    for container in $WORKERS $CONSUMERS; do docker stop "$container" > /dev/null 2>&1; done
-    # Kill rclone and wait a beat
+    for container in $WORKERS $CONSUMERS $ENABLERS; do docker stop "$container" > /dev/null 2>&1; done
     killall -9 rclone > /dev/null 2>&1
-    sleep 2
+    [ -n "$RC_PORT" ] && fuser -k "$RC_PORT/tcp" > /dev/null 2>&1                           
     umount -l "$MOUNT_PATH" > /dev/null 2>&1
     [ -n "$DECYPH_PATH" ] && umount -l "$DECYPH_PATH" > /dev/null 2>&1
+    rm -rf "$VFS_CACHE_DIR/vfsMeta"                                                         
     rm -f "$STATE_FILE"
 fi
 
@@ -154,7 +162,8 @@ if [[ "$MOUNT_ALIVE" == "false" ]] || [[ "$TRIGGER_RESET" == "true" ]]; then
       $RC_ARGS --log-level INFO --log-file "$LOG_FILE" > /dev/null 2>&1 &                   
     disown $!
 
-    COUNT=0; while ! timeout 2s [ -d "$VALIDATION_SUBFOLDER" ] && [ $COUNT -lt 15 ]; do sleep 2; ((COUNT++)); done 
+    COUNT=0; # Force a real read check during the rebuild wait period
+    while ! timeout 2s ls "$VALIDATION_SUBFOLDER" > /dev/null 2>&1 && [ $COUNT -lt 15 ]; do sleep 2; ((COUNT++)); done 
     if ! timeout 2s [ -d "$VALIDATION_SUBFOLDER" ]; then                                        
         notify "alert" "Rclone mount failed to rebuild."
         sed -i '/FAIL_COUNT=/d' "$STATE_FILE" 2>/dev/null; echo "FAIL_COUNT=$((CUR_FAIL + 1))" >> "$STATE_FILE"                                
@@ -164,7 +173,7 @@ fi
 
 # --- STAGE 4: PRIMING ---
 log_step "INITIATING: Library Priming..."
-if timeout 2s [ -d "$VALIDATION_SUBFOLDER" ]; then                                              
+if timeout 2s ls "$VALIDATION_SUBFOLDER" > /dev/null 2>&1; then                                              
     [ -f "$STATE_FILE" ] && source "$STATE_FILE"
     START_TIME=$(date +%s); LAST_RUN_TS=${LAST_PRIMED_TS:-0}; TOTAL_KNOWN=${TOTAL_INDEXED:-0}
     NEW_FILES=$(find "$LOCAL_MEDIA_PATH" -type l -newermt "@$LAST_RUN_TS" -exec ls -d {} + 2>/dev/null | wc -l)
