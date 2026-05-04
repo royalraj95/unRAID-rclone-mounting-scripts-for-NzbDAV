@@ -1,7 +1,7 @@
 #!/bin/bash
 # ======================================================================================
 # SCRIPT: Rclone Heartbeat & Intelligent Priming
-# VERSION: v1.0-RC1.4
+# VERSION: v1.0-RC1.4.1
 # DESCRIPTION: Monitors Rclone mounts and performs "Smart Priming" (Newest first,
 #               then historical debt). Hardened for portability.
 # ======================================================================================
@@ -11,10 +11,10 @@
 # --------------------------------------------------------------------------------------
 
 # --- SCRIPT SETTINGS ---
-HARD_RESET="N"                                                                               # Y/N. A Hard reset stops rclone and removes as many traces as possible so that it will remount on next run. Also stops dockers
-MAX_LOAD="350"                                                                               # Stop mount and run a force reset if the Server load exceeds this
-MAX_FAILURES="1"                                                                             # How many times to allow the mount check to fail before automatically applying a Hard Reset to try and Fix
-PRIME_MAX_TIME="300"                                                                         # Pre-fills --dir-cache to optimise start times and arr activity. Set Time to spend priming the --dir-cache on each run. Runs will always check for newest files first, and then resume priming older files not yet indexed
+HARD_RESET="N"                                                                                # Y/N. A Hard reset stops rclone and removes as many traces as possible so that it will remount on next run. Also stops dockers
+MAX_LOAD="350"                                                                                # Stop mount and run a force reset if the Server load exceeds this
+MAX_FAILURES="1"                                                                              # How many times to allow the mount check to fail before automatically applying a Hard Reset to try and Fix
+PRIME_MAX_TIME="300"                                                                          # Pre-fills --dir-cache to optimise start times and arr activity. Set Time to spend priming the --dir-cache on each run. Runs will always check for newest files first, and then resume priming older files not yet indexed
 STATE_FILE="/mnt/user/appdata/other/scripts/nzbdav/prime_state.db"
 LOG_FILE="/mnt/user/appdata/other/scripts/nzbdav/rclone_mount.log"
 
@@ -23,6 +23,7 @@ REMOTE_NAME="nzb-dav:"                                                          
 RCLONE_CONF="/boot/config/plugins/rclone/.rclone.conf"
 MOUNT_PATH="/mnt/computers/streaming/nzbdav"                                                  # full path to where remote should be mounted
 VFS_CACHE_DIR="/mnt/computers/streaming/cache/nzbdav"                                         # Path for rclone cache files
+VFS_CACHE_SIZE="100G"                                                                         # Maximum size of the VFS cache
 LOCAL_MEDIA_PATH="/mnt/computers/streaming/media"                                             # Where your media is stored
 
 VFS_MODE="writes"                                                                             # --vfs-cache-mode mode. I use writes instead of full, as I have a 1Gbps line and lots of memory so I don't want unnecessary disk writes and just use my RAM 
@@ -37,7 +38,7 @@ ATTR_TIME="2000h"                                                               
 # --- OPTIONAL MOUNT SETTINGS (Leave as "" to disable) ---
 DECYPH_PATH="/mnt/computers/streaming/decypharr"                                              # Location of your Decypharr mount
 RC_IP="0.0.0.0"                                                                               # Recommend leave as 0.0.0.0
-RC_PORT="5572"                                                           
+RC_PORT="5572"                                                                           
 RC_USER="your_username"   
 RC_PASS="your_password"
 CPU_PIN="8,9,10,11,12,13,24,25,26,27,28,29"                                                   # Control which cores rclone uses
@@ -243,7 +244,7 @@ NZB_MOUNT_ALIVE=true
 if ! timeout 5s ls "$VALIDATION_SUBFOLDER" > /dev/null 2>&1; then
     NZB_MOUNT_ALIVE=false
     log_step "[!] ALERT: NzbDAV rclone mount unreachable."
-fi # <--- This 'fi' was missing, causing your error
+fi
 
 # 2. PROBE: Decypharr mount (if path is defined)
 DECYPH_MOUNT_ALIVE=true
@@ -295,7 +296,7 @@ DECYPH_SUCCESS=${DECYPH_SUCCESS:-"false"}
 
 # --- STAGE 3.1: MOUNT EXECUTION ---
 # Only execute if a reset was triggered or the mount is confirmed dead
-if [[ "$TRIGGER_HARD_RESET" == "true" ]] || [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then                                           
+if [[ "$TRIGGER_HARD_RESET" == "true" ]] || [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then                                               
     log_step "REBUILD: Starting Rclone mount process at $MOUNT_PATH..."
     
     # Final check: only unmount if still showing in mtab
@@ -309,6 +310,7 @@ if [[ "$TRIGGER_HARD_RESET" == "true" ]] || [[ "$NZB_MOUNT_ALIVE" == "false" ]];
     # Background launch with performance flags
     nohup $LAUNCHER rclone mount "$REMOTE_NAME" "$MOUNT_PATH" \
       --config "$RCLONE_CONF" --vfs-cache-mode "$VFS_MODE" --cache-dir "$VFS_CACHE_DIR" \
+      --vfs-cache-max-size "$VFS_CACHE_SIZE" \
       --buffer-size "$RAM_BUFFER" --vfs-read-chunk-size "$CHUNK_START" --vfs-read-chunk-size-limit "$CHUNK_LIMIT" \
       --vfs-read-chunk-streams "$STREAMS" --transfers "$TRANSFERS" --dir-cache-time "$CACHE_TIME" --attr-timeout "$ATTR_TIME" \
       --no-modtime --no-checksum --async-read --links --use-cookies --allow-other \
@@ -378,7 +380,7 @@ log_step "INITIATING: Intelligent Priming (Completed Symlinks > Library)..."
 
 [ -f "$STATE_FILE" ] && source "$STATE_FILE"
 
-if timeout 2s ls "$VALIDATION_SUBFOLDER" > /dev/null 2>&1; then                                              
+if timeout 2s ls "$VALIDATION_SUBFOLDER" > /dev/null 2>&1; then                                             
     START_TIME=$(date +%s)
     LAST_RUN_TS=${LAST_PRIMED_TS:-0}
     CS_COUNT=0
