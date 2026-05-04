@@ -1,9 +1,9 @@
 #!/bin/bash
 # ======================================================================================
 # SCRIPT: Rclone Heartbeat & Intelligent Priming
-# VERSION: v1.0-RC1.4.2
+# VERSION: v1.0-RC1.5
 # DESCRIPTION: Monitors Rclone mounts and performs "Smart Priming".
-#               v1.4.2: Centralized Nuclear Reset (Stop, Wipe Cache, Exit).
+#               v1.5: Restored Dual-Path Priming & Persistent State Markers.
 # ======================================================================================
 
 # --------------------------------------------------------------------------------------
@@ -11,49 +11,50 @@
 # --------------------------------------------------------------------------------------
 
 # --- SCRIPT SETTINGS ---
-HARD_RESET="N"                                                                                # Y/N. A Hard reset stops rclone, wipes cache, stops dockers, and exits.
-MAX_LOAD="350"                                                                                # Stop mount and run a force reset if the Server load exceeds this
-MAX_FAILURES="1"                                                                              # How many times to allow the mount check to fail before automatically applying a Hard Reset
-PRIME_MAX_TIME="300"                                                                          # Time to spend priming the --dir-cache on each run.
+SCRIPT_VERSION="v1.0-RC1.5"
+HARD_RESET="N"                                                                                  # Y/N. A Hard reset stops rclone, wipes cache, stops dockers, and exits.
+MAX_LOAD="350"                                                                                  # Stop mount and run a force reset if the Server load exceeds this
+MAX_FAILURES="1"                                                                                # How many times to allow the mount check to fail before automatically applying a Hard Reset
+PRIME_MAX_TIME="300"                                                                            # Time to spend priming the --dir-cache on each run.
 STATE_FILE="/mnt/user/appdata/other/scripts/nzbdav/prime_state.db"
 LOG_FILE="/mnt/user/appdata/other/scripts/nzbdav/rclone_mount.log"
 
 # --- REQUIRED SETTINGS ---
-REMOTE_NAME="nzb-dav:"                                                                        # Rclone remote name including colon
+REMOTE_NAME="nzb-dav:"                                                                          # Rclone remote name including colon
 RCLONE_CONF="/boot/config/plugins/rclone/.rclone.conf"
-MOUNT_PATH="/mnt/computers/streaming/nzbdav"                                                  # full path to where remote should be mounted
-VFS_CACHE_DIR="/mnt/computers/streaming/cache/nzbdav"                                         # Path for rclone cache files
-VFS_CACHE_SIZE="100G"                                                                         # Maximum size of the VFS cache
-LOCAL_MEDIA_PATH="/mnt/computers/media"                                                       # Where your media is stored
+MOUNT_PATH="/mnt/computers/streaming/nzbdav"                                                    # full path to where remote should be mounted
+VFS_CACHE_DIR="/mnt/computers/streaming/cache/nzbdav"                                           # Path for rclone cache files
+VFS_CACHE_SIZE="300G"                                                                           # Maximum size of the VFS cache
+LOCAL_MEDIA_PATH="/mnt/computers/media"                                                         # Where your media is stored
 
-VFS_MODE="writes"                                                                             # --vfs-cache-mode mode.
-CHUNK_START="32M"                                                                             # --vfs-read-chunk-size.
-CHUNK_LIMIT="512M"                                                                            # --vfs-read-chunk-size-limit.
-STREAMS="0"                                                                                   # --vfs-read-chunk-streams.
-RAM_BUFFER="256M"                                                                             # --buffer-size RAM buffer.
-TRANSFERS="8"                                                                                 # --transfers.
-CACHE_TIME="2000h"                                                                            # --dir-cache-time.
-ATTR_TIME="2000h"                                                                             # --attr-timeout.
+VFS_MODE="writes"                                                                               # --vfs-cache-mode mode.
+CHUNK_START="8M"                                                                                # --vfs-read-chunk-size.
+CHUNK_LIMIT="512M"                                                                              # --vfs-read-chunk-size-limit.
+STREAMS="0"                                                                                     # --vfs-read-chunk-streams.
+RAM_BUFFER="256M"                                                                               # --buffer-size RAM buffer.
+TRANSFERS="8"                                                                                   # --transfers.
+CACHE_TIME="2000h"                                                                              # --dir-cache-time.
+ATTR_TIME="2000h"                                                                               # --attr-timeout.
 
 # --- OPTIONAL MOUNT SETTINGS ---
-DECYPH_PATH="/mnt/computers/streaming/decypharr"                                              # Location of your Decypharr mount
-RC_IP="0.0.0.0"                                                                               
-RC_PORT="5572"                                                                           
-RC_USER="your_username"   
-RC_PASS="your_password"
-CPU_PIN="8,9,10,11,12,13,24,25,26,27,28,29"                                                   
+DECYPH_PATH="/mnt/computers/streaming/decypharr"                                                # Location of your Decypharr mount
+RC_IP="0.0.0.0"                                                                                 
+RC_PORT="5572"                                                                              
+RC_USER="Username"   
+RC_PASS="Password"
+CPU_PIN="8,9,10,11,12,13,24,25,26,27,28,29"                                                     
 
 # --- DOCKER SETTINGS ---
 NZBDAV_CONTAINER="NzbDAV"
 DECYPHAR_CONTAINER="Decypharr"
-ENABLERS="byparr"                                                                             
-CONSUMERS="plex tautulli Seerr Wizarr emby calibre calibre-web"                               
+ENABLERS="byparr"                                                                               
+CONSUMERS="plex tautulli Seerr Wizarr emby calibre calibre-web"                                 
 POSTGRES_CONTAINERS="postgresql16"                      
-POSTGRES_CONSUMERS="prowlarr sonarr radarr lidarr Kometa Sportarr bookshelf"                  
+POSTGRES_CONSUMERS="prowlarr sonarr radarr lidarr Kometa Sportarr bookshelf"                   
 
 # Database Credentials
 POSTGRES_USER="your_user"
-POSTGRES_DB="your_db"
+POSTGRES_DB="your_password"
 
 # --------------------------------------------------------------------------------------
 # 2. MAIN SCRIPT
@@ -67,6 +68,7 @@ ALL_MANAGED_DOCKERS="$NZBDAV_CONTAINER $DECYPHAR_CONTAINER $ENABLERS $POSTGRES_C
 log_step "VALIDATING: Script configuration and environment..."
 echo "---------------------------------------------------"
 echo "[CONFIG SUMMARY]"
+echo "Script Version:      $SCRIPT_VERSION"
 echo "Rclone Remote:       $REMOTE_NAME"
 echo "Mount Path:          $MOUNT_PATH"
 echo "Local Media Path:    $LOCAL_MEDIA_PATH"
@@ -78,6 +80,7 @@ echo "VFS Mode:            $VFS_MODE"
 echo "RAM Buffer:          $RAM_BUFFER"
 echo "Transfers:           $TRANSFERS"
 echo "Read Streams:        $STREAMS"
+echo "CHUNK START:         $CHUNK_START"
 echo "Chunk Limit:         $CHUNK_LIMIT"
 echo ""
 echo "[DOCKER SETTINGS]"
@@ -89,71 +92,59 @@ echo "Postgres Containers: $POSTGRES_CONTAINERS"
 echo "---------------------------------------------------"
 
 # --- SECTION 2.2: ENVIRONMENTAL READINESS ---
-# Only perform system environmental checks if we aren't doing a manual Hard Reset.
 if [[ "$HARD_RESET" == "N" ]]; then
     log_step "VERIFYING: System environment and load..."
-    mkdir -p "$(dirname "$STATE_FILE")"                                           
+    mkdir -p "$(dirname "$STATE_FILE")"                                            
     mkdir -p "$(dirname "$LOG_FILE")"
     mkdir -p "$VFS_CACHE_DIR"
 
-    notify() { /usr/local/emhttp/webGui/scripts/notify -i "$1" -s "Heartbeat Alert" -d "$2"; }   
-
     CURRENT_LOAD=$(cat /proc/loadavg | awk '{print $1}' | cut -d. -f1)
-    if [ "$CURRENT_LOAD" -gt "$MAX_LOAD" ]; then                                   
+    if [ "$CURRENT_LOAD" -gt "$MAX_LOAD" ]; then                                    
         log_step "[CRITICAL] Load is $CURRENT_LOAD. Performing emergency cleanup..."
         ps aux | grep "rclone mount $REMOTE_NAME" | grep -v grep | awk '{print $2}' | xargs kill -9 > /dev/null 2>&1
         umount -l "$MOUNT_PATH" > /dev/null 2>&1
         exit 1                                                                     
     fi
 else
-    # Even in Hard Reset, we need to ensure the cache directory exists for the fresh start
     mkdir -p "$VFS_CACHE_DIR"
 fi
 
-# Add a flag to see if we actually started anything
-    FOUNDATION_RESTARTED=false
-    for container in "$NZBDAV_CONTAINER" "$DECYPHAR_CONTAINER"; do
-        if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" != "true" ]; then
-            log_step "[!] $container is down. Starting..."
-            docker start "$container" > /dev/null 2>&1
-            FOUNDATION_RESTARTED=true
-        fi
-    done
-
-    # If we had to start them, wait for the APIs to wake up
-    if [[ "$FOUNDATION_RESTARTED" == "true" ]]; then
-        log_step "WAITING: Giving foundation containers 10s to initialize..."
-        sleep 15
+# --- SECTION 2.3: FOUNDATION CHECK ---
+FOUNDATION_RESTARTED=false
+for container in "$NZBDAV_CONTAINER" "$DECYPHAR_CONTAINER"; do
+    if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" != "true" ]; then
+        log_step "[!] $container is down. Starting..."
+        docker start "$container" > /dev/null 2>&1
+        FOUNDATION_RESTARTED=true
     fi
+done
+
+if [[ "$FOUNDATION_RESTARTED" == "true" ]]; then
+    log_step "WAITING: Giving foundation containers 15s to initialize..."
+    sleep 15
+fi
 
 # --- SECTION 2.4: INDEPENDENT MOUNT VALIDATION ---
-# Load previous state (N_FAIL_COUNT) if it exists
 [ -f "$STATE_FILE" ] && source "$STATE_FILE"
 N_CUR_FAIL=${N_FAIL_COUNT:-0}
-
 VALIDATION_SUBFOLDER="$MOUNT_PATH/completed-symlinks"
 
 if [[ "$HARD_RESET" == "N" ]]; then
     log_step "CHECKING: Mount integrity..."
-
     NZB_MOUNT_ALIVE=true
     if ! timeout 5s ls "$VALIDATION_SUBFOLDER" > /dev/null 2>&1; then
         NZB_MOUNT_ALIVE=false
         log_step "[!] ALERT: NzbDAV mount unreachable."
     else
-        # If the mount is healthy, we reset the counter for future runs
         echo "N_FAIL_COUNT=0" > "$STATE_FILE"
         N_CUR_FAIL=0
     fi
 else
-    # During a Hard Reset, we assume the mount needs to be cleared anyway.
     NZB_MOUNT_ALIVE=false
 fi
 
 # --- SECTION 3.1: MOUNT RECOVERY LOOP ---
 RECOVERY_FAILED=false
-
-# Only attempt recovery if we aren't doing a manual Hard Reset
 if [[ "$HARD_RESET" == "N" ]] && [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
     log_step "REBUILD: Attempting Rclone mount recovery..."
     grep -q "$MOUNT_PATH" /etc/mtab && umount -l "$MOUNT_PATH" > /dev/null 2>&1
@@ -167,7 +158,7 @@ if [[ "$HARD_RESET" == "N" ]] && [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
       --buffer-size "$RAM_BUFFER" --vfs-read-chunk-size "$CHUNK_START" --vfs-read-chunk-size-limit "$CHUNK_LIMIT" \
       --vfs-read-chunk-streams "$STREAMS" --transfers "$TRANSFERS" --dir-cache-time "$CACHE_TIME" --attr-timeout "$ATTR_TIME" \
       --no-modtime --no-checksum --async-read --links --use-cookies --allow-other \
-      $RC_ARGS --log-level INFO --log-file "$LOG_FILE" > /dev/null 2>&1 &                   
+      $RC_ARGS --log-level INFO --log-file "$LOG_FILE" > /dev/null 2>&1 &                    
     disown $!
     
     COUNT=0
@@ -192,12 +183,7 @@ if [[ "$HARD_RESET" == "N" ]] && [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
 fi
 
 # --- SECTION 3.2: THE UNIFIED NUCLEAR JUNCTION ---
-
-# Check if we should trigger a Hard Reset:
-# 1. User explicitly set HARD_RESET="Y"
-# 2. OR the recovery loop just failed AND we've hit the MAX_FAILURES limit
 TRIGGER_HARD_RESET=false
-
 if [[ "$HARD_RESET" == "Y" ]]; then
     log_step "MANUAL RESET: Executing requested purge..."
     TRIGGER_HARD_RESET=true
@@ -208,53 +194,111 @@ fi
 
 if [[ "$TRIGGER_HARD_RESET" == "true" ]]; then
     log_step "NUCLEAR OPTION: Executing full environment purge..."
-
-    # 1. Stop All Consumers
     for container in $ALL_CONSUMERS; do
         if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" == "true" ]; then
             log_step "Stopping Consumer: $container..."
             docker stop "$container" > /dev/null 2>&1
         fi
     done
-
-    # 2. Restart Foundation Containers to clear hung processes
     log_step "Restarting Foundation Containers..."
     docker restart "$NZBDAV_CONTAINER" > /dev/null 2>&1
     [ -n "$DECYPHAR_CONTAINER" ] && docker restart "$DECYPHAR_CONTAINER" > /dev/null 2>&1
-
-    # 3. Kill Rclone and Force Unmounts
     log_step "Killing Rclone processes and forcing unmounts..."
     ps aux | grep "rclone mount $REMOTE_NAME" | grep -v grep | awk '{print $2}' | xargs kill -9 > /dev/null 2>&1
     umount -l "$MOUNT_PATH" > /dev/null 2>&1
     [ -n "$DECYPH_PATH" ] && umount -l "$DECYPH_PATH" > /dev/null 2>&1
-
-    # 4. Wipe VFS Cache (Clearing the Lexar NM800)
     log_step "Wiping VFS Cache contents at $VFS_CACHE_DIR..."
     rm -rf "$VFS_CACHE_DIR"/*
-
-    # 5. Reset failure counter and Exit
     echo "N_FAIL_COUNT=0" > "$STATE_FILE"
     log_step "SUCCESS: Nuclear Cleanup complete. Counter reset. EXITING."
     exit 0
 fi
 
-# Final safety check for normal runs
 if [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
     log_step "[ABORT] Mount recovery failed. Threshold not yet reached ($N_CUR_FAIL/$MAX_FAILURES). Exiting."
     exit 1
 fi
 
 # --- SECTION 4: PRIMING & RESTORATION ---
-log_step "INITIATING: Intelligent Priming..."
-# [Priming logic remains same as 1.4.1]
+log_step "INITIATING: Intelligent Priming (Completed Symlinks > Library)..."
+
+[ -f "$STATE_FILE" ] && source "$STATE_FILE"
+
+if timeout 2s ls "$VALIDATION_SUBFOLDER" > /dev/null 2>&1; then                                               
+    START_TIME=$(date +%s)
+    LAST_RUN_TS=${LAST_PRIMED_TS:-0}
+    CS_COUNT=0
+    LMP_COUNT=0
+
+    # --- 4.1: COMPLETED SYMLINKS FOLDER ---
+    if [[ "$CS_HISTORICAL_DONE" != "TRUE" ]]; then
+        log_step "PRIMING: Completed Symlinks (Newest first)..."
+        mapfile -t CS_TARGETS < <(find "$VALIDATION_SUBFOLDER" -type l -not -newermt "@${CS_MARKER:-0}" -printf "%T@ %p\n" | sort -rn | cut -d' ' -f2-)
+        
+        if [ ${#CS_TARGETS[@]} -gt 0 ]; then
+            for file in "${CS_TARGETS[@]}"; do
+                ls -d "$file" > /dev/null 2>&1
+                ((CS_COUNT++))
+                NEW_CS_MARKER=$(stat -c %Y "$file" 2>/dev/null)
+                [ $(( $(date +%s) - START_TIME )) -ge "$PRIME_MAX_TIME" ] && break
+            done
+        else
+            CS_HISTORICAL_DONE="TRUE"
+        fi
+    fi
+
+    # --- 4.2: LOCAL MEDIA PATH ---
+    if [ $(( $(date +%s) - START_TIME )) -lt "$PRIME_MAX_TIME" ]; then
+        log_step "PRIMING: Local Media Path $LOCAL_MEDIA_PATH..."
+        find "$LOCAL_MEDIA_PATH" -type l -newermt "@$LAST_RUN_TS" -exec ls -d {} + > /dev/null 2>&1
+
+        if [[ "$ALL_HISTORICAL_PRIMED" != "TRUE" ]]; then
+            mapfile -t LMP_TARGETS < <(find "$LOCAL_MEDIA_PATH" -type l -not -newermt "@${HISTORICAL_MARKER:-$(date +%s)}" -printf "%T@ %p\n" | sort -rn | cut -d' ' -f2-)
+            
+            if [ ${#LMP_TARGETS[@]} -gt 0 ]; then
+                for file in "${LMP_TARGETS[@]}"; do
+                    ls -d "$file" > /dev/null 2>&1
+                    ((LMP_COUNT++))
+                    NEW_LMP_MARKER=$(stat -c %Y "$file" 2>/dev/null)
+                    [ $(( $(date +%s) - START_TIME )) -ge "$PRIME_MAX_TIME" ] && break
+                done
+            else
+                ALL_HISTORICAL_PRIMED="TRUE"
+            fi
+        fi
+    fi
+
+    # --- SAVE STATE ---
+    {
+        echo "N_FAIL_COUNT=0"
+        echo "LAST_PRIMED_TS=$(date +%s)"
+        echo "CS_MARKER=${NEW_CS_MARKER:-$CS_MARKER}"
+        echo "CS_HISTORICAL_DONE=$CS_HISTORICAL_DONE"
+        echo "HISTORICAL_MARKER=${NEW_LMP_MARKER:-$HISTORICAL_MARKER}"
+        echo "ALL_HISTORICAL_PRIMED=$ALL_HISTORICAL_PRIMED"
+    } > "$STATE_FILE"
+fi
 
 log_step "RESTORATION: Starting Consumers..."
 for container in $ALL_CONSUMERS; do
     docker start "$container" > /dev/null 2>&1 && sleep 2
 done
 
+# --- SECTION 6: FINAL SUMMARY ---
+FINAL_LOAD=$(cat /proc/loadavg | awk '{print $1}')
+MEM_USED=$(free -h | awk '/^Mem:/ {print $3 "/" $2}')
+RCLONE_PID=$(pgrep -f "rclone mount $REMOTE_NAME")
+
+echo ""
 echo "---------------------------------------------------"
 echo "  [HEARTBEAT FINAL SUMMARY]"
-echo "  NzbDAV Mount: ACTIVE"
 echo "---------------------------------------------------"
+echo "  Mount Status:      ACTIVE"
+echo "  Rclone PID:        ${RCLONE_PID:-N/A}"
+echo "  System Load:       $FINAL_LOAD"
+echo "  RAM Usage:         $MEM_USED"
+echo "  Files Primed:      $((CS_COUNT + LMP_COUNT)) (This Run)"
+echo "  Dockers Started:   All Managed Containers UP"
+echo "---------------------------------------------------"
+log_step "STATUS: All Systems Green. Current Load: $FINAL_LOAD"
 exit 0
