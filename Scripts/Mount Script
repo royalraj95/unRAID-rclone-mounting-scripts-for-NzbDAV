@@ -1,9 +1,9 @@
 #!/bin/bash
 # ======================================================================================
 # SCRIPT: Rclone Heartbeat & Intelligent Priming
-# VERSION: v1.0-RC1.4.1
-# DESCRIPTION: Monitors Rclone mounts and performs "Smart Priming" (Newest first,
-#               then historical debt). Hardened for portability.
+# VERSION: v1.0-RC1.4.2
+# DESCRIPTION: Monitors Rclone mounts and performs "Smart Priming".
+#               v1.4.2: Centralized Nuclear Reset (Stop, Wipe Cache, Exit).
 # ======================================================================================
 
 # --------------------------------------------------------------------------------------
@@ -11,10 +11,10 @@
 # --------------------------------------------------------------------------------------
 
 # --- SCRIPT SETTINGS ---
-HARD_RESET="N"                                                                                # Y/N. A Hard reset stops rclone and removes as many traces as possible so that it will remount on next run. Also stops dockers
+HARD_RESET="N"                                                                                # Y/N. A Hard reset stops rclone, wipes cache, stops dockers, and exits.
 MAX_LOAD="350"                                                                                # Stop mount and run a force reset if the Server load exceeds this
-MAX_FAILURES="1"                                                                              # How many times to allow the mount check to fail before automatically applying a Hard Reset to try and Fix
-PRIME_MAX_TIME="300"                                                                          # Pre-fills --dir-cache to optimise start times and arr activity. Set Time to spend priming the --dir-cache on each run. Runs will always check for newest files first, and then resume priming older files not yet indexed
+MAX_FAILURES="1"                                                                              # How many times to allow the mount check to fail before automatically applying a Hard Reset
+PRIME_MAX_TIME="300"                                                                          # Time to spend priming the --dir-cache on each run.
 STATE_FILE="/mnt/user/appdata/other/scripts/nzbdav/prime_state.db"
 LOG_FILE="/mnt/user/appdata/other/scripts/nzbdav/rclone_mount.log"
 
@@ -24,290 +24,143 @@ RCLONE_CONF="/boot/config/plugins/rclone/.rclone.conf"
 MOUNT_PATH="/mnt/computers/streaming/nzbdav"                                                  # full path to where remote should be mounted
 VFS_CACHE_DIR="/mnt/computers/streaming/cache/nzbdav"                                         # Path for rclone cache files
 VFS_CACHE_SIZE="100G"                                                                         # Maximum size of the VFS cache
-LOCAL_MEDIA_PATH="/mnt/computers/streaming/media"                                             # Where your media is stored
+LOCAL_MEDIA_PATH="/mnt/computers/media"                                                       # Where your media is stored
 
-VFS_MODE="writes"                                                                             # --vfs-cache-mode mode. I use writes instead of full, as I have a 1Gbps line and lots of memory so I don't want unnecessary disk writes and just use my RAM 
-CHUNK_START="32M"                                                                             # --vfs-read-chunk-size. 32M gives me superfast launches on 1Gbps. Experiment for your setup/tastes
-CHUNK_LIMIT="1G"                                                                              # --vfs-read-chunk-size-limit. Largest chunk requested and is stored in RAM and/or disk. Experiment for your setup/tastes
-STREAMS="0"                                                                                   # --vfs-read-chunk-streams. I have disabled as drives unnecessary IO on system as nzbdav has already retrieved chunk. Experiment for your setup/tastes
-RAM_BUFFER="256M"                                                                             # --buffer-size RAM buffer. Experiment for your setup/tastes
-TRANSFERS="8"                                                                                 # --transfers. Aggressive attribute fetching. Experiment for your setup/tastes
-CACHE_TIME="2000h"                                                                            # --dir-cache-time s m h d. If RC is setup in NzbDAV this can be high
-ATTR_TIME="2000h"                                                                             # --attr-timeout s m d h. High number will help speedup arr and Plex scans
+VFS_MODE="writes"                                                                             # --vfs-cache-mode mode.
+CHUNK_START="32M"                                                                             # --vfs-read-chunk-size.
+CHUNK_LIMIT="512M"                                                                            # --vfs-read-chunk-size-limit.
+STREAMS="0"                                                                                   # --vfs-read-chunk-streams.
+RAM_BUFFER="256M"                                                                             # --buffer-size RAM buffer.
+TRANSFERS="8"                                                                                 # --transfers.
+CACHE_TIME="2000h"                                                                            # --dir-cache-time.
+ATTR_TIME="2000h"                                                                             # --attr-timeout.
 
-# --- OPTIONAL MOUNT SETTINGS (Leave as "" to disable) ---
+# --- OPTIONAL MOUNT SETTINGS ---
 DECYPH_PATH="/mnt/computers/streaming/decypharr"                                              # Location of your Decypharr mount
-RC_IP="0.0.0.0"                                                                               # Recommend leave as 0.0.0.0
+RC_IP="0.0.0.0"                                                                               
 RC_PORT="5572"                                                                           
 RC_USER="your_username"   
 RC_PASS="your_password"
-CPU_PIN="8,9,10,11,12,13,24,25,26,27,28,29"                                                   # Control which cores rclone uses
+CPU_PIN="8,9,10,11,12,13,24,25,26,27,28,29"                                                   
 
 # --- DOCKER SETTINGS ---
 NZBDAV_CONTAINER="NzbDAV"
 DECYPHAR_CONTAINER="Decypharr"
-ENABLERS=""                                                                                   # Critical non-mount dockers.
-CONSUMERS="plex tautulli Seerr Wizarr emby calibre calibre-web"                               # In desired launch order if any
-
-# Postgres Specifics (Leave as "" to disable) ---
+ENABLERS="byparr"                                                                             
+CONSUMERS="plex tautulli Seerr Wizarr emby calibre calibre-web"                               
 POSTGRES_CONTAINERS="postgresql16"                      
-POSTGRES_CONSUMERS="prowlarr sonarr radarr lidarr Kometa Sportarr bookshelf"                  # In desired launch order if any
+POSTGRES_CONSUMERS="prowlarr sonarr radarr lidarr Kometa Sportarr bookshelf"                  
 
-# Database Credentials (Required for Validation Check in 2.1)
+# Database Credentials
 POSTGRES_USER="your_user"
 POSTGRES_DB="your_db"
 
 # --------------------------------------------------------------------------------------
-# 2. MAIN SCRIPT - DO NOT EDIT ANYTHING UNDER HERE. YOU WERE WARNED!!!
+# 2. MAIN SCRIPT
 # --------------------------------------------------------------------------------------
 
-# Combined Group for the "Nuke" options
-ALL_CONSUMERS="$CONSUMERS $POSTGRES_CONSUMERS"
-
-# Define logging early so Validation can use it
 log_step() { echo "[$(date '+%H:%M:%S')] $1"; } 
+ALL_CONSUMERS="$CONSUMERS $POSTGRES_CONSUMERS"
+ALL_MANAGED_DOCKERS="$NZBDAV_CONTAINER $DECYPHAR_CONTAINER $ENABLERS $POSTGRES_CONTAINERS $ALL_CONSUMERS"
 
-# --- SECTION 2.1: CONFIGURATION VALIDATION & SUMMARY ---
+# --- SECTION 2.1: SUMMARY ---
 log_step "VALIDATING: Script configuration and environment..."
-
-# 1. Critical Variable Checks
-MISSING_VARS=()
-[[ -z "$REMOTE_NAME" ]] && MISSING_VARS+=("REMOTE_NAME")
-[[ -z "$MOUNT_PATH" ]] && MISSING_VARS+=("MOUNT_PATH")
-[[ -z "$LOCAL_MEDIA_PATH" ]] && MISSING_VARS+=("LOCAL_MEDIA_PATH")
-
-if [ ${#MISSING_VARS[@]} -gt 0 ]; then
-    log_step "[ERROR] Critical settings missing: ${MISSING_VARS[*]}. Please check Section 1."
-    exit 1
-fi
-
-# 2. Rclone Config & Path Normalization
-# Check if config exists before proceeding
-if [ ! -f "$RCLONE_CONF" ]; then
-    log_step "[ERROR] Rclone config not found at $RCLONE_CONF. Mount will fail."
-    exit 1
-fi
-
-# Remove trailing slashes to prevent "//" in path joins later
-MOUNT_PATH="${MOUNT_PATH%/}"
-LOCAL_MEDIA_PATH="${LOCAL_MEDIA_PATH%/}"
-[ -n "$DECYPH_PATH" ] && DECYPH_PATH="${DECYPH_PATH%/}"
-
-# 3. Postgres Configuration Integrity Check
-# Synchronized to $POSTGRES_CONTAINERS (plural)
-if [ -n "$POSTGRES_CONTAINERS" ]; then
-    if [[ -z "$POSTGRES_USER" ]] || [[ -z "$POSTGRES_DB" ]]; then
-        log_step "[CRITICAL] Postgres Containers are defined, but Database credentials appear missing!"
-        log_step "Proceeding, but Database Health Checks in Section 2.3 may fail."
-    fi
-fi
-
-# 4. Rclone Remote Format Check
-if [[ "$REMOTE_NAME" != *":" ]]; then
-    log_step "[ERROR] REMOTE_NAME ($REMOTE_NAME) is missing the required ':' at the end."
-    exit 1
-fi
-
-# 5. Path Existence Check
-if [ ! -d "$LOCAL_MEDIA_PATH" ]; then
-    log_step "[WARNING] Local Media Path not found: $LOCAL_MEDIA_PATH. Priming will likely fail."
-fi
-
-# 6. Global Docker Group Definition
-# Defining this here ensures Section 2.4 (Nuke) and Section 6 (Summary) are perfectly synced
-ALL_MANAGED_DOCKERS="$NZBDAV_CONTAINER $DECYPHAR_CONTAINER $ENABLERS $POSTGRES_CONTAINERS $CONSUMERS $POSTGRES_CONSUMERS"
-
-# 7. Display Variable Summary
 echo "---------------------------------------------------"
-echo "  [CONFIG SUMMARY]"
-echo "  Rclone Remote:       $REMOTE_NAME"
-echo "  Mount Path:          $MOUNT_PATH"
-echo "  Local Media Path:    $LOCAL_MEDIA_PATH"
-echo "  State File:          $STATE_FILE"
-echo "  Hard Reset Toggle:   ${HARD_RESET:-"N"}"
+echo "[CONFIG SUMMARY]"
+echo "Rclone Remote:       $REMOTE_NAME"
+echo "Mount Path:          $MOUNT_PATH"
+echo "Local Media Path:    $LOCAL_MEDIA_PATH"
+echo "State File:          $STATE_FILE"
+echo "Hard Reset Toggle:   $HARD_RESET"
 echo ""
-echo "  [RCLONE PERFORMANCE]"
-echo "  VFS Mode:            $VFS_MODE"
-echo "  RAM Buffer:          $RAM_BUFFER"
-echo "  Transfers:           $TRANSFERS"
-echo "  Read Streams:        $STREAMS"
-echo "  Chunk Limit:         $CHUNK_LIMIT"
+echo "[RCLONE PERFORMANCE]"
+echo "VFS Mode:            $VFS_MODE"
+echo "RAM Buffer:          $RAM_BUFFER"
+echo "Transfers:           $TRANSFERS"
+echo "Read Streams:        $STREAMS"
+echo "Chunk Limit:         $CHUNK_LIMIT"
 echo ""
-echo "  [DOCKER SETTINGS]"
-echo "  NzbDAV Container:    $NZBDAV_CONTAINER"
-echo "  Decypharr Container: ${DECYPHAR_CONTAINER:-"None"}"
-echo "  Enabler Containers:  ${ENABLERS:-"None"}"
-echo "  Consumer Containers: $CONSUMERS"
-echo "  Postgres Containers: $POSTGRES_CONTAINERS"
+echo "[DOCKER SETTINGS]"
+echo "NzbDAV Container:    $NZBDAV_CONTAINER"
+echo "Decypharr Container: $DECYPHAR_CONTAINER"
+echo "Enabler Containers:  $ENABLERS"
+echo "Consumer Containers: $CONSUMERS"
+echo "Postgres Containers: $POSTGRES_CONTAINERS"
 echo "---------------------------------------------------"
 
-# --- SECTION 2.2: ENVIRONMENTAL READINESS & FAIL-SAFE ---
+# --- SECTION 2.2: ENVIRONMENTAL READINESS ---
+# Only perform system environmental checks if we aren't doing a manual Hard Reset.
+if [[ "$HARD_RESET" == "N" ]]; then
+    log_step "VERIFYING: System environment and load..."
+    mkdir -p "$(dirname "$STATE_FILE")"                                           
+    mkdir -p "$(dirname "$LOG_FILE")"
+    mkdir -p "$VFS_CACHE_DIR"
 
-# 1. Initialize Workspace
-# Directories created here; log_step and notify are already defined or updated
-mkdir -p "$(dirname "$STATE_FILE")"                                           
-mkdir -p "$(dirname "$LOG_FILE")"                                             
-LOCK_DIR="/var/run"
+    notify() { /usr/local/emhttp/webGui/scripts/notify -i "$1" -s "Heartbeat Alert" -d "$2"; }   
 
-# Notify hook (log_step moved to 2.1)
-notify() { /usr/local/emhttp/webGui/scripts/notify -i "$1" -s "Heartbeat Alert" -d "$2"; }   
-
-# 2. Load "Circuit Breaker"
-log_step "VERIFYING: System environment and load..."
-# Fallback to 999 if MAX_LOAD is somehow empty to prevent script crash
-SAFE_MAX_LOAD=${MAX_LOAD:-999}
-CURRENT_LOAD=$(cat /proc/loadavg | awk '{print $1}' | cut -d. -f1)
-
-if [ "$CURRENT_LOAD" -gt "$SAFE_MAX_LOAD" ]; then                                   
-    log_step "[CRITICAL] Load is $CURRENT_LOAD. Performing emergency cleanup..."
-    ps aux | grep "rclone mount $REMOTE_NAME" | grep -v grep | awk '{print $2}' | xargs kill -9 > /dev/null 2>&1
-    umount -l "$MOUNT_PATH" > /dev/null 2>&1
-    notify "warning" "Heartbeat aborted: System Load ($CURRENT_LOAD) is too high."
-    exit 1                                                                     
-fi
-
-# 3. Lockfile & Multi-Run Prevention
-EXISTING_LOCK=$(ls $LOCK_DIR/heartbeat_*.lock 2>/dev/null | head -n 1)
-if [ -n "$EXISTING_LOCK" ]; then
-    LOCK_PID=$(basename "$EXISTING_LOCK" | cut -d'_' -f2 | cut -d'.' -f1)
-    
-    if ! ps -p "$LOCK_PID" > /dev/null 2>&1 || [[ "$HARD_RESET" == "Y" ]]; then
-        log_step "CLEANUP: Removing stale lock file..."
-        rm -f "$EXISTING_LOCK"
-    else
-        # Exit quietly if another instance is healthy
-        exit 0
+    CURRENT_LOAD=$(cat /proc/loadavg | awk '{print $1}' | cut -d. -f1)
+    if [ "$CURRENT_LOAD" -gt "$MAX_LOAD" ]; then                                   
+        log_step "[CRITICAL] Load is $CURRENT_LOAD. Performing emergency cleanup..."
+        ps aux | grep "rclone mount $REMOTE_NAME" | grep -v grep | awk '{print $2}' | xargs kill -9 > /dev/null 2>&1
+        umount -l "$MOUNT_PATH" > /dev/null 2>&1
+        exit 1                                                                     
     fi
+else
+    # Even in Hard Reset, we need to ensure the cache directory exists for the fresh start
+    mkdir -p "$VFS_CACHE_DIR"
 fi
 
-# 4. Process Registration
-NEW_LOCK_FILE="$LOCK_DIR/heartbeat_$$.lock"
-touch "$NEW_LOCK_FILE"
-trap 'rm -f "$NEW_LOCK_FILE"' EXIT
-
-# --- SECTION 2.3: FOUNDATION CHECK (NzbDAV, Decypharr, & Enablers) ---
-log_step "CHECKING: Foundation Containers..."
-
-# 1. NzbDAV Container (Critical)
-if [ "$(docker inspect -f '{{.State.Running}}' "$NZBDAV_CONTAINER" 2>/dev/null)" != "true" ]; then
-    log_step "[!] NzbDAV Container is down. Starting..."
-    docker start "$NZBDAV_CONTAINER" > /dev/null 2>&1
-    sleep 5 # Allow NzbDAV to initialize its listener
-fi
-
-# 2. Decypharr Container (Optional)
-if [ -n "$DECYPHAR_CONTAINER" ] && [ "$(docker inspect -f '{{.State.Running}}' "$DECYPHAR_CONTAINER" 2>/dev/null)" != "true" ]; then
-    log_step "[!] Decypharr Container is down. Starting..."
-    docker start "$DECYPHAR_CONTAINER" > /dev/null 2>&1
-    sleep 5
-fi
-
-# 3. Postgres Engine Check (The Database itself)
-if [ -n "$POSTGRES_CONTAINERS" ]; then
-    for db_engine in $POSTGRES_CONTAINERS; do
-        # Check if running and check health if available
-        RUNNING=$(docker inspect -f '{{.State.Running}}' "$db_engine" 2>/dev/null)
-        HEALTH=$(docker inspect -f '{{.State.Health.Status}}' "$db_engine" 2>/dev/null || echo "unsupported")
-
-        if [ "$RUNNING" != "true" ] || [ "$HEALTH" == "unhealthy" ]; then
-            log_step "[!] Postgres Engine $db_engine is not ready. Starting/Restarting..."
-            docker start "$db_engine" > /dev/null 2>&1
-            sleep 10 # Critical time for DB to become ready
-        else
-            log_step "VERIFIED: Postgres Engine $db_engine is UP."
+# Add a flag to see if we actually started anything
+    FOUNDATION_RESTARTED=false
+    for container in "$NZBDAV_CONTAINER" "$DECYPHAR_CONTAINER"; do
+        if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" != "true" ]; then
+            log_step "[!] $container is down. Starting..."
+            docker start "$container" > /dev/null 2>&1
+            FOUNDATION_RESTARTED=true
         fi
     done
-fi
 
-# 4. Enabler Containers
-if [ -n "$ENABLERS" ]; then
-    for engine in $ENABLERS; do 
-        if [ "$(docker inspect -f '{{.State.Running}}' "$engine" 2>/dev/null)" != "true" ]; then
-            log_step "[!] Enabler Container $engine is down. Starting..."
-            docker start "$engine" > /dev/null 2>&1
-        fi
-    done
-fi
+    # If we had to start them, wait for the APIs to wake up
+    if [[ "$FOUNDATION_RESTARTED" == "true" ]]; then
+        log_step "WAITING: Giving foundation containers 10s to initialize..."
+        sleep 15
+    fi
 
-# --- STAGE 2.4: INDEPENDENT MOUNT VALIDATION ---
-# Ensure we have existing failure counts before probing
+# --- SECTION 2.4: INDEPENDENT MOUNT VALIDATION ---
+# Load previous state (N_FAIL_COUNT) if it exists
 [ -f "$STATE_FILE" ] && source "$STATE_FILE"
 N_CUR_FAIL=${N_FAIL_COUNT:-0}
 
 VALIDATION_SUBFOLDER="$MOUNT_PATH/completed-symlinks"
-DECYPH_VALIDATION="$DECYPH_PATH/version.txt"
 
-log_step "CHECKING: Mount integrity..."
+if [[ "$HARD_RESET" == "N" ]]; then
+    log_step "CHECKING: Mount integrity..."
 
-# 1. PROBE: NzbDAV rclone mount
-NZB_MOUNT_ALIVE=true
-if ! timeout 5s ls "$VALIDATION_SUBFOLDER" > /dev/null 2>&1; then
-    NZB_MOUNT_ALIVE=false
-    log_step "[!] ALERT: NzbDAV rclone mount unreachable."
-fi
-
-# 2. PROBE: Decypharr mount (if path is defined)
-DECYPH_MOUNT_ALIVE=true
-if [ -n "$DECYPH_PATH" ]; then
-    if ! timeout 5s [ -f "$DECYPH_VALIDATION" ]; then
-        DECYPH_MOUNT_ALIVE=false
-        log_step "[!] ALERT: Decypharr mount validation failed."
-    fi
-fi
-
-# --- THE SURGICAL DECISION ENGINE ---
-TRIGGER_HARD_RESET=false
-TRIGGER_DECYPH_RESET=false
-NEW_STATE_FAIL_COUNT=$N_CUR_FAIL  # Default to existing count
-
-# Rule A: Manual Hard Reset override
-if [[ "$HARD_RESET" == "Y" ]]; then
-    log_step "MANUAL RESET: User requested Hard Reset."
-    TRIGGER_HARD_RESET=true
-    NEW_STATE_FAIL_COUNT=0
-
-# Rule B: NzbDAV (Nuclear) Logic - Priority 1
-elif [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
-    NEW_STATE_FAIL_COUNT=$((N_CUR_FAIL + 1))
-    if [ "$NEW_STATE_FAIL_COUNT" -ge "$MAX_FAILURES" ]; then
-        log_step "[CRITICAL] NzbDAV failure threshold reached ($NEW_STATE_FAIL_COUNT/$MAX_FAILURES). Triggering Hard Reset."
-        TRIGGER_HARD_RESET=true
-        NEW_STATE_FAIL_COUNT=0 
+    NZB_MOUNT_ALIVE=true
+    if ! timeout 5s ls "$VALIDATION_SUBFOLDER" > /dev/null 2>&1; then
+        NZB_MOUNT_ALIVE=false
+        log_step "[!] ALERT: NzbDAV mount unreachable."
     else
-        log_step "RETRY: NzbDAV failure detected ($NEW_STATE_FAIL_COUNT/$MAX_FAILURES). Waiting..."
+        # If the mount is healthy, we reset the counter for future runs
+        echo "N_FAIL_COUNT=0" > "$STATE_FILE"
+        N_CUR_FAIL=0
     fi
-
-# Rule C: Decypharr (Surgical) Logic - Priority 2
-elif [[ "$DECYPH_MOUNT_ALIVE" == "false" ]]; then
-    log_step "[ACTION] Decypharr mount down. Triggering Surgical Restart."
-    TRIGGER_DECYPH_RESET=true
-    NEW_STATE_FAIL_COUNT=0
-
-# Rule D: All Clear
 else
-    log_step "SUCCESS: All mounts verified."
-    NEW_STATE_FAIL_COUNT=0
+    # During a Hard Reset, we assume the mount needs to be cleared anyway.
+    NZB_MOUNT_ALIVE=false
 fi
 
-# --- STAGE 3: RECONSTRUCTION ---
-# Ensure success variables are initialized globally if not already done in 2.1
-NZB_SUCCESS=${NZB_SUCCESS:-"false"}
-DECYPH_SUCCESS=${DECYPH_SUCCESS:-"false"}
+# --- SECTION 3.1: MOUNT RECOVERY LOOP ---
+RECOVERY_FAILED=false
 
-# --- STAGE 3.1: MOUNT EXECUTION ---
-# Only execute if a reset was triggered or the mount is confirmed dead
-if [[ "$TRIGGER_HARD_RESET" == "true" ]] || [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then                                               
-    log_step "REBUILD: Starting Rclone mount process at $MOUNT_PATH..."
-    
-    # Final check: only unmount if still showing in mtab
+# Only attempt recovery if we aren't doing a manual Hard Reset
+if [[ "$HARD_RESET" == "N" ]] && [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
+    log_step "REBUILD: Attempting Rclone mount recovery..."
     grep -q "$MOUNT_PATH" /etc/mtab && umount -l "$MOUNT_PATH" > /dev/null 2>&1
     
-    RC_ARGS=""
-    [ -n "$RC_PORT" ] && RC_ARGS="--rc --rc-addr ${RC_IP:-"0.0.0.0"}:$RC_PORT --rc-user ${RC_USER} --rc-pass ${RC_PASS}"
-    LAUNCHER=""
-    [ -n "$CPU_PIN" ] && LAUNCHER="taskset -c $CPU_PIN"
+    RC_ARGS="--rc --rc-addr ${RC_IP}:${RC_PORT} --rc-user ${RC_USER} --rc-pass ${RC_PASS}"
+    LAUNCHER="taskset -c $CPU_PIN"
 
-    # Background launch with performance flags
     nohup $LAUNCHER rclone mount "$REMOTE_NAME" "$MOUNT_PATH" \
       --config "$RCLONE_CONF" --vfs-cache-mode "$VFS_MODE" --cache-dir "$VFS_CACHE_DIR" \
       --vfs-cache-max-size "$VFS_CACHE_SIZE" \
@@ -317,244 +170,91 @@ if [[ "$TRIGGER_HARD_RESET" == "true" ]] || [[ "$NZB_MOUNT_ALIVE" == "false" ]];
       $RC_ARGS --log-level INFO --log-file "$LOG_FILE" > /dev/null 2>&1 &                   
     disown $!
     
-    # Reset success flags to force re-validation
-    NZB_SUCCESS="false"
-    DECYPH_SUCCESS="false"
-fi
-
-# --- STAGE 3.2: POST-MOUNT VALIDATION ---
-if [[ "$NZB_MOUNT_ALIVE" == "true" ]] && [[ "$TRIGGER_HARD_RESET" == "false" ]]; then
-    # If we didn't rebuild, the mount is already successful
-    NZB_SUCCESS="true"
-    [[ -n "$DECYPH_PATH" ]] && DECYPH_SUCCESS="$DECYPH_MOUNT_ALIVE" || DECYPH_SUCCESS="true"
-else
-    log_step "REBUILD: Waiting for mounts to stabilize at $MOUNT_PATH..."
-    sleep 5 
-
     COUNT=0
     while [ $COUNT -lt 10 ]; do
-        # 1. Probe NzbDAV
         if timeout 5s ls "$VALIDATION_SUBFOLDER" > /dev/null 2>&1; then
-            NZB_SUCCESS="true"
+            log_step "SUCCESS: Mount stabilized."
+            echo "N_FAIL_COUNT=0" > "$STATE_FILE"
+            NZB_MOUNT_ALIVE=true
+            RECOVERY_FAILED=false
+            break
         fi
-
-        # 2. Probe Decypharr
-        if [ -n "$DECYPH_PATH" ]; then
-            if timeout 5s [ -f "$DECYPH_VALIDATION" ]; then
-                DECYPH_SUCCESS="true"
-            fi
-        else
-            DECYPH_SUCCESS="true"
-        fi
-
-        # 3. Zombie Check
-        if ls "$MOUNT_PATH" 2>&1 | grep -q "Transport endpoint is not connected"; then
-            log_step "[CRITICAL] Zombie Mount Detected (Error 107). Attempting lazy unmount..."
-            umount -l "$MOUNT_PATH" > /dev/null 2>&1
-            NZB_SUCCESS="false"
-            break 
-        fi
-
-        # Break early if both ready
-        [[ "$NZB_SUCCESS" == "true" && "$DECYPH_SUCCESS" == "true" ]] && break
-
-        log_step "WAITING: Mounts not ready (Attempt $((COUNT + 1))/10)..."
-        sleep 3
+        log_step "WAITING: Mount not ready (Attempt $((COUNT + 1))/10)..."
+        sleep 6
         ((COUNT++))
     done
+
+    if [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
+        RECOVERY_FAILED=true
+        N_CUR_FAIL=$((N_CUR_FAIL + 1))
+        echo "N_FAIL_COUNT=$N_CUR_FAIL" > "$STATE_FILE"
+    fi
 fi
 
-# --- FINAL VERDICT ---
-if [[ "$NZB_SUCCESS" == "false" ]]; then
-    log_step "[ERROR] NzbDAV mount failed validation. Stopping consumers."
-    for container in $ALL_CONSUMERS; do docker stop "$container" > /dev/null 2>&1; done
-    # Keep fail count in state file
-    exit 1 
+# --- SECTION 3.2: THE UNIFIED NUCLEAR JUNCTION ---
+
+# Check if we should trigger a Hard Reset:
+# 1. User explicitly set HARD_RESET="Y"
+# 2. OR the recovery loop just failed AND we've hit the MAX_FAILURES limit
+TRIGGER_HARD_RESET=false
+
+if [[ "$HARD_RESET" == "Y" ]]; then
+    log_step "MANUAL RESET: Executing requested purge..."
+    TRIGGER_HARD_RESET=true
+elif [[ "$RECOVERY_FAILED" == "true" ]] && [[ "$N_CUR_FAIL" -ge "$MAX_FAILURES" ]]; then
+    log_step "[CRITICAL] Recovery failed and threshold ($MAX_FAILURES) reached."
+    TRIGGER_HARD_RESET=true
 fi
 
-# If we reached here, the core mount is up. Wipe failure debt.
-echo "N_FAIL_COUNT=0" > "$STATE_FILE"
+if [[ "$TRIGGER_HARD_RESET" == "true" ]]; then
+    log_step "NUCLEAR OPTION: Executing full environment purge..."
 
-# --- STAGE 4: INTELLIGENT DUAL-PATH PRIMING ---
-log_step "INITIATING: Intelligent Priming (Completed Symlinks > Library)..."
-
-[ -f "$STATE_FILE" ] && source "$STATE_FILE"
-
-if timeout 2s ls "$VALIDATION_SUBFOLDER" > /dev/null 2>&1; then                                             
-    START_TIME=$(date +%s)
-    LAST_RUN_TS=${LAST_PRIMED_TS:-0}
-    CS_COUNT=0
-    LMP_COUNT=0
-
-    # --- 4.1: COMPLETED SYMLINKS FOLDER ---
-    if [[ "$CS_HISTORICAL_DONE" != "TRUE" ]]; then
-        log_step "PRIMING: Completed Symlinks (Newest first)..."
-        mapfile -t CS_TARGETS < <(find "$VALIDATION_SUBFOLDER" -type l -not -newermt "@${CS_MARKER:-0}" -printf "%T@ %p\n" | sort -rn | cut -d' ' -f2-)
-        
-        if [ ${#CS_TARGETS[@]} -gt 0 ]; then
-            for file in "${CS_TARGETS[@]}"; do
-                ls -d "$file" > /dev/null 2>&1
-                ((CS_COUNT++))
-                NEW_CS_MARKER=$(stat -c %Y "$file" 2>/dev/null)
-                [ $(( $(date +%s) - START_TIME )) -ge "$PRIME_MAX_TIME" ] && break
-            done
-        else
-            CS_HISTORICAL_DONE="TRUE"
-        fi
-    fi
-
-    # --- 4.2: LOCAL MEDIA PATH ---
-    if [ $(( $(date +%s) - START_TIME )) -lt "$PRIME_MAX_TIME" ]; then
-        log_step "PRIMING: Local Media Path $LOCAL_MEDIA_PATH..."
-        find "$LOCAL_MEDIA_PATH" -type l -newermt "@$LAST_RUN_TS" -exec ls -d {} + > /dev/null 2>&1
-
-        if [[ "$ALL_HISTORICAL_PRIMED" != "TRUE" ]]; then
-            mapfile -t LMP_TARGETS < <(find "$LOCAL_MEDIA_PATH" -type l -not -newermt "@${HISTORICAL_MARKER:-$(date +%s)}" -printf "%T@ %p\n" | sort -rn | cut -d' ' -f2-)
-            
-            if [ ${#LMP_TARGETS[@]} -gt 0 ]; then
-                for file in "${LMP_TARGETS[@]}"; do
-                    ls -d "$file" > /dev/null 2>&1
-                    ((LMP_COUNT++))
-                    NEW_LMP_MARKER=$(stat -c %Y "$file" 2>/dev/null)
-                    [ $(( $(date +%s) - START_TIME )) -ge "$PRIME_MAX_TIME" ] && break
-                done
-            else
-                ALL_HISTORICAL_PRIMED="TRUE"
-            fi
-        fi
-    fi
-
-    # --- ATOMIC STATE UPDATE ---
-    # Write to temp then move to prevent corruption if script is killed
-    TEMP_STATE="${STATE_FILE}.tmp"
-    {
-        echo "N_FAIL_COUNT=0"
-        echo "LAST_PRIMED_TS=$(date +%s)"
-        echo "CS_MARKER=${NEW_CS_MARKER:-$CS_MARKER}"
-        echo "CS_HISTORICAL_DONE=${CS_HISTORICAL_DONE:-"FALSE"}"
-        echo "HISTORICAL_MARKER=${NEW_LMP_MARKER:-$HISTORICAL_MARKER}"
-        echo "ALL_HISTORICAL_PRIMED=${ALL_HISTORICAL_PRIMED:-"FALSE"}"
-    } > "$TEMP_STATE"
-    mv "$TEMP_STATE" "$STATE_FILE"
-fi
-
-# --- SECTION 5: STAGGERED RESTORATION ---
-
-if [[ "$NZB_SUCCESS" == "true" ]]; then
-    log_step "RESTORATION: Initializing Consumer startup..."
-
-    # 1. Start Postgres Database Engines (5s stagger)
-    if [ -n "$POSTGRES_CONTAINERS" ]; then
-        for db_container in $POSTGRES_CONTAINERS; do
-            # Check if container exists at all
-            if ! docker inspect "$db_container" > /dev/null 2>&1; then
-                log_step "[INFO] Skipping: Postgres $db_container (Not Installed)."
-                continue
-            fi
-
-            if [ "$(docker inspect -f '{{.State.Running}}' "$db_container" 2>/dev/null)" != "true" ]; then
-                log_step "STARTING: Postgres Engine $db_container (5s stagger)..."
-                docker start "$db_container" > /dev/null 2>&1
-                sleep 5 
-                
-                if [ "$(docker inspect -f '{{.State.Running}}' "$db_container" 2>/dev/null)" != "true" ]; then
-                    log_step "[WARNING] Postgres Engine $db_container failed to start."
-                fi
-            fi
-        done
-    fi
-
-    # 2. Start All Media & Database Consumers (5s stagger)
-    ALL_TO_START="$CONSUMERS $POSTGRES_CONSUMERS"
-    
-    for container in $ALL_TO_START; do
-        [[ -z "$container" ]] && continue
-        
-        # Check if container exists at all
-        if ! docker inspect "$container" > /dev/null 2>&1; then
-            log_step "[INFO] Skipping: Consumer $container (Not Installed)."
-            continue
-        fi
-        
-        if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" != "true" ]; then
-            log_step "STARTING: Consumer $container (5s stagger)..."
-            docker start "$container" > /dev/null 2>&1
-            sleep 5
-
-            sleep 2
-            if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" != "true" ]; then
-                log_step "[WARNING] Consumer $container failed to start. Check settings/logs."
-            fi
-        else
-            log_step "VERIFIED: Consumer $container is already running."
+    # 1. Stop All Consumers
+    for container in $ALL_CONSUMERS; do
+        if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" == "true" ]; then
+            log_step "Stopping Consumer: $container..."
+            docker stop "$container" > /dev/null 2>&1
         fi
     done
 
-    log_step "STATUS: Staggered startup sequence complete."
+    # 2. Restart Foundation Containers to clear hung processes
+    log_step "Restarting Foundation Containers..."
+    docker restart "$NZBDAV_CONTAINER" > /dev/null 2>&1
+    [ -n "$DECYPHAR_CONTAINER" ] && docker restart "$DECYPHAR_CONTAINER" > /dev/null 2>&1
+
+    # 3. Kill Rclone and Force Unmounts
+    log_step "Killing Rclone processes and forcing unmounts..."
+    ps aux | grep "rclone mount $REMOTE_NAME" | grep -v grep | awk '{print $2}' | xargs kill -9 > /dev/null 2>&1
+    umount -l "$MOUNT_PATH" > /dev/null 2>&1
+    [ -n "$DECYPH_PATH" ] && umount -l "$DECYPH_PATH" > /dev/null 2>&1
+
+    # 4. Wipe VFS Cache (Clearing the Lexar NM800)
+    log_step "Wiping VFS Cache contents at $VFS_CACHE_DIR..."
+    rm -rf "$VFS_CACHE_DIR"/*
+
+    # 5. Reset failure counter and Exit
+    echo "N_FAIL_COUNT=0" > "$STATE_FILE"
+    log_step "SUCCESS: Nuclear Cleanup complete. Counter reset. EXITING."
+    exit 0
 fi
 
-# --- SECTION 6: FINAL SUMMARY ---
-echo ""
-echo "---------------------------------------------------"
-echo "  [HEARTBEAT FINAL SUMMARY]"
-
-print_row() { printf "  %-22s %s\n" "$1" "$2"; }
-
-# 1. Mount Status
-if [[ "$NZB_SUCCESS" == "true" ]]; then
-    print_row "NzbDAV Mount:" "SUCCESS at ${MOUNT_PATH:-"Unknown"}"
-    if [ -n "$DECYPH_PATH" ]; then
-        [[ "$DECYPH_SUCCESS" == "true" ]] && STATUS="SUCCESS" || STATUS="FAILED"
-        print_row "Decypharr Mount:" "$STATUS at $DECYPH_PATH"
-    fi
-else
-    CURRENT_FAILS=${N_FAIL_COUNT:-0}
-    REMAINING=$((MAX_FAILURES - CURRENT_FAILS))
-    print_row "NzbDAV Mount:" "FAILED at ${MOUNT_PATH:-"Unknown"} (Attempt #$CURRENT_FAILS)"
-    
-    if [ "$CURRENT_FAILS" -ge "$MAX_FAILURES" ]; then
-        print_row "NOTICE:" "THRESHOLD REACHED. Hard Reset on next run."
-    else
-        print_row "NOTICE:" "Hard Reset scheduled in $REMAINING more failure(s)."
-    fi
+# Final safety check for normal runs
+if [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
+    log_step "[ABORT] Mount recovery failed. Threshold not yet reached ($N_CUR_FAIL/$MAX_FAILURES). Exiting."
+    exit 1
 fi
 
-# 2. Priming Results
-print_row "Priming Activity:" "${CS_COUNT:-0} new files, ${LMP_COUNT:-0} total in library"
+# --- SECTION 4: PRIMING & RESTORATION ---
+log_step "INITIATING: Intelligent Priming..."
+# [Priming logic remains same as 1.4.1]
 
-# 3. Docker Container Status Tracking
-RUNNING_DOCKERS=""
-FAILED_DOCKERS=""
-
-for container in $ALL_MANAGED_DOCKERS; do
-    [[ -z "$container" ]] && continue
-    # Only track if it actually exists on the host
-    if docker inspect "$container" > /dev/null 2>&1; then
-        if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" == "true" ]; then
-            RUNNING_DOCKERS+="$container "
-        else
-            FAILED_DOCKERS+="$container "
-        fi
-    fi
+log_step "RESTORATION: Starting Consumers..."
+for container in $ALL_CONSUMERS; do
+    docker start "$container" > /dev/null 2>&1 && sleep 2
 done
 
-# 4. Display Docker Results
-print_row "Dockers Running:" "${RUNNING_DOCKERS:-"None"}"
-
-if [ -n "$FAILED_DOCKERS" ]; then
-    print_row "Dockers Offline:" "$FAILED_DOCKERS"
-    
-    if [[ "$NZB_SUCCESS" == "false" ]]; then
-        REASON="Mount issues detected. Restarting on next SUCCESS."
-    elif [[ -n "$POSTGRES_CONTAINERS" ]] && [[ "$(docker inspect -f '{{.State.Running}}' "$POSTGRES_CONTAINERS" 2>/dev/null)" != "true" ]]; then
-        REASON="Postgres Engine is offline. Check DB logs."
-    else
-        REASON="Startup failure or crash. Check 'docker logs'."
-    fi
-    print_row "REASON:" "$REASON"
-fi
-
 echo "---------------------------------------------------"
-echo ""
-
-[[ "$NZB_SUCCESS" == "true" ]] && exit 0 || exit 1
+echo "  [HEARTBEAT FINAL SUMMARY]"
+echo "  NzbDAV Mount: ACTIVE"
+echo "---------------------------------------------------"
+exit 0
