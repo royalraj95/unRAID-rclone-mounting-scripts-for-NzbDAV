@@ -1,9 +1,9 @@
 #!/bin/bash
 # ======================================================================================
 # SCRIPT: Rclone Heartbeat & Intelligent Priming
-# VERSION: v1.0-RC1.5
+# VERSION: v1.0-RC1.5.2
 # DESCRIPTION: Monitors Rclone mounts and performs "Smart Priming".
-#               v1.5: Restored Dual-Path Priming & Persistent State Markers.
+#               v1.5.2: Cleaned Summary UI and refined Load/RAM decimal reporting.
 # ======================================================================================
 
 # --------------------------------------------------------------------------------------
@@ -11,7 +11,7 @@
 # --------------------------------------------------------------------------------------
 
 # --- SCRIPT SETTINGS ---
-SCRIPT_VERSION="v1.0-RC1.5"
+SCRIPT_VERSION="v1.0-RC1.5.2"
 HARD_RESET="N"                                                                                  # Y/N. A Hard reset stops rclone, wipes cache, stops dockers, and exits.
 MAX_LOAD="350"                                                                                  # Stop mount and run a force reset if the Server load exceeds this
 MAX_FAILURES="1"                                                                                # How many times to allow the mount check to fail before automatically applying a Hard Reset
@@ -40,8 +40,8 @@ ATTR_TIME="2000h"                                                               
 DECYPH_PATH="/mnt/computers/streaming/decypharr"                                                # Location of your Decypharr mount
 RC_IP="0.0.0.0"                                                                                 
 RC_PORT="5572"                                                                              
-RC_USER="Username"   
-RC_PASS="Password"
+RC_USER="username"   
+RC_PASS="password"
 CPU_PIN="8,9,10,11,12,13,24,25,26,27,28,29"                                                     
 
 # --- DOCKER SETTINGS ---
@@ -53,8 +53,8 @@ POSTGRES_CONTAINERS="postgresql16"
 POSTGRES_CONSUMERS="prowlarr sonarr radarr lidarr Kometa Sportarr bookshelf"                   
 
 # Database Credentials
-POSTGRES_USER="your_user"
-POSTGRES_DB="your_password"
+POSTGRES_USER="db_user"
+POSTGRES_DB="db_password"
 
 # --------------------------------------------------------------------------------------
 # 2. MAIN SCRIPT
@@ -70,8 +70,6 @@ echo "---------------------------------------------------"
 echo "[CONFIG SUMMARY]"
 echo "Script Version:      $SCRIPT_VERSION"
 echo "Rclone Remote:       $REMOTE_NAME"
-echo "Mount Path:          $MOUNT_PATH"
-echo "Local Media Path:    $LOCAL_MEDIA_PATH"
 echo "State File:          $STATE_FILE"
 echo "Hard Reset Toggle:   $HARD_RESET"
 echo ""
@@ -131,13 +129,34 @@ VALIDATION_SUBFOLDER="$MOUNT_PATH/completed-symlinks"
 
 if [[ "$HARD_RESET" == "N" ]]; then
     log_step "CHECKING: Mount integrity..."
-    NZB_MOUNT_ALIVE=true
+    
     if ! timeout 5s ls "$VALIDATION_SUBFOLDER" > /dev/null 2>&1; then
         NZB_MOUNT_ALIVE=false
         log_step "[!] ALERT: NzbDAV mount unreachable."
+        if [[ "$NZB_STATE" != "DOWN" ]]; then
+            NZB_STATE="DOWN"
+            NZB_START_TS=$(date +%s)
+        fi
     else
+        NZB_MOUNT_ALIVE=true
+        if [[ "$NZB_STATE" != "UP" ]]; then
+            NZB_STATE="UP"
+            NZB_START_TS=$(date +%s)
+        fi
         echo "N_FAIL_COUNT=0" > "$STATE_FILE"
         N_CUR_FAIL=0
+    fi
+
+    if ! timeout 5s ls "$DECYPH_PATH" > /dev/null 2>&1; then
+        if [[ "$DEC_STATE" != "DOWN" ]]; then
+            DEC_STATE="DOWN"
+            DEC_START_TS=$(date +%s)
+        fi
+    else
+        if [[ "$DEC_STATE" != "UP" ]]; then
+            DEC_STATE="UP"
+            DEC_START_TS=$(date +%s)
+        fi
     fi
 else
     NZB_MOUNT_ALIVE=false
@@ -165,7 +184,15 @@ if [[ "$HARD_RESET" == "N" ]] && [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
     while [ $COUNT -lt 10 ]; do
         if timeout 5s ls "$VALIDATION_SUBFOLDER" > /dev/null 2>&1; then
             log_step "SUCCESS: Mount stabilized."
-            echo "N_FAIL_COUNT=0" > "$STATE_FILE"
+            NZB_STATE="UP"
+            NZB_START_TS=$(date +%s)
+            {
+                echo "N_FAIL_COUNT=0"
+                echo "NZB_STATE=\"$NZB_STATE\""
+                echo "NZB_START_TS=\"$NZB_START_TS\""
+                echo "DEC_STATE=\"$DEC_STATE\""
+                echo "DEC_START_TS=\"$DEC_START_TS\""
+            } > "$STATE_FILE"
             NZB_MOUNT_ALIVE=true
             RECOVERY_FAILED=false
             break
@@ -178,7 +205,13 @@ if [[ "$HARD_RESET" == "N" ]] && [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
     if [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
         RECOVERY_FAILED=true
         N_CUR_FAIL=$((N_CUR_FAIL + 1))
-        echo "N_FAIL_COUNT=$N_CUR_FAIL" > "$STATE_FILE"
+        {
+            echo "N_FAIL_COUNT=$N_CUR_FAIL"
+            echo "NZB_STATE=\"$NZB_STATE\""
+            echo "NZB_START_TS=\"$NZB_START_TS\""
+            echo "DEC_STATE=\"$DEC_STATE\""
+            echo "DEC_START_TS=\"$DEC_START_TS\""
+        } > "$STATE_FILE"
     fi
 fi
 
@@ -209,7 +242,17 @@ if [[ "$TRIGGER_HARD_RESET" == "true" ]]; then
     [ -n "$DECYPH_PATH" ] && umount -l "$DECYPH_PATH" > /dev/null 2>&1
     log_step "Wiping VFS Cache contents at $VFS_CACHE_DIR..."
     rm -rf "$VFS_CACHE_DIR"/*
-    echo "N_FAIL_COUNT=0" > "$STATE_FILE"
+    NZB_STATE="DOWN"
+    NZB_START_TS=$(date +%s)
+    DEC_STATE="DOWN"
+    DEC_START_TS=$(date +%s)
+    {
+        echo "N_FAIL_COUNT=0"
+        echo "NZB_STATE=\"$NZB_STATE\""
+        echo "NZB_START_TS=\"$NZB_START_TS\""
+        echo "DEC_STATE=\"$DEC_STATE\""
+        echo "DEC_START_TS=\"$DEC_START_TS\""
+    } > "$STATE_FILE"
     log_step "SUCCESS: Nuclear Cleanup complete. Counter reset. EXITING."
     exit 0
 fi
@@ -270,12 +313,16 @@ if timeout 2s ls "$VALIDATION_SUBFOLDER" > /dev/null 2>&1; then
 
     # --- SAVE STATE ---
     {
-        echo "N_FAIL_COUNT=0"
+        echo "N_FAIL_COUNT=${N_CUR_FAIL:-0}"
         echo "LAST_PRIMED_TS=$(date +%s)"
         echo "CS_MARKER=${NEW_CS_MARKER:-$CS_MARKER}"
         echo "CS_HISTORICAL_DONE=$CS_HISTORICAL_DONE"
         echo "HISTORICAL_MARKER=${NEW_LMP_MARKER:-$HISTORICAL_MARKER}"
         echo "ALL_HISTORICAL_PRIMED=$ALL_HISTORICAL_PRIMED"
+        echo "NZB_STATE=\"$NZB_STATE\""
+        echo "NZB_START_TS=\"$NZB_START_TS\""
+        echo "DEC_STATE=\"$DEC_STATE\""
+        echo "DEC_START_TS=\"$DEC_START_TS\""
     } > "$STATE_FILE"
 fi
 
@@ -285,20 +332,35 @@ for container in $ALL_CONSUMERS; do
 done
 
 # --- SECTION 6: FINAL SUMMARY ---
-FINAL_LOAD=$(cat /proc/loadavg | awk '{print $1}')
-MEM_USED=$(free -h | awk '/^Mem:/ {print $3 "/" $2}')
-RCLONE_PID=$(pgrep -f "rclone mount $REMOTE_NAME")
+log_step "FINALIZING: Generating environment report..."
+
+CUR_LOAD=$(awk '{print $1}' /proc/loadavg)
+RAM_TOTAL=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+RAM_FREE=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
+RAM_PERC=$(awk "BEGIN {printf \"%.1f\", ($RAM_FREE/$RAM_TOTAL)*100}")
+
+calculate_duration() {
+    local diff=$(($(date +%s) - $1))
+    local days=$((diff / 86400))
+    local hours=$(( (diff % 86400) / 3600 ))
+    local mins=$(( (diff % 3600) / 60 ))
+    [ $days -gt 0 ] && echo "${days}d ${hours}h ${mins}m" || ([ $hours -gt 0 ] && echo "${hours}h ${mins}m" || echo "${mins}m")
+}
+
+NZB_TIME=$(calculate_duration ${NZB_START_TS:-$(date +%s)})
+DEC_TIME=$(calculate_duration ${DEC_START_TS:-$(date +%s)})
 
 echo ""
-echo "---------------------------------------------------"
-echo "  [HEARTBEAT FINAL SUMMARY]"
-echo "---------------------------------------------------"
-echo "  Mount Status:      ACTIVE"
-echo "  Rclone PID:        ${RCLONE_PID:-N/A}"
-echo "  System Load:       $FINAL_LOAD"
-echo "  RAM Usage:         $MEM_USED"
-echo "  Files Primed:      $((CS_COUNT + LMP_COUNT)) (This Run)"
-echo "  Dockers Started:   All Managed Containers UP"
-echo "---------------------------------------------------"
-log_step "STATUS: All Systems Green. Current Load: $FINAL_LOAD"
+echo "--------------------------------------------------------------------------------------"
+echo "  NZBDAV MOUNT & ENVIRONMENT REPORT - $SCRIPT_VERSION"
+echo "--------------------------------------------------------------------------------------"
+printf "%-30s | %-10s | %-15s\n" "COMPONENT" "STATUS" "UP/DOWN TIME"
+echo "--------------------------------------------------------------------------------------"
+printf "%-30s | %-10s | %-15s\n" "NzbDAV Rclone Mount" "$NZB_STATE" "$NZB_TIME"
+printf "%-30s | %-10s | %-15s\n" "Decypharr Mount" "$DEC_STATE" "$DEC_TIME"
+echo "--------------------------------------------------------------------------------------"
+printf "%-30s | %-28s\n" "System Load (1m)" "$CUR_LOAD (Max: $MAX_LOAD)"
+printf "%-30s | %-28s\n" "System RAM Available" "$RAM_PERC%"
+echo "--------------------------------------------------------------------------------------"
+log_step "STATUS: All Systems Operational. Files Primed: $((CS_COUNT + LMP_COUNT))"
 exit 0
