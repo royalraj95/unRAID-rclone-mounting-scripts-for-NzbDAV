@@ -1,7 +1,7 @@
 #!/bin/bash
 # ======================================================================================
 # SCRIPT: The Janitor (Array Shutdown Orchestrator)
-# VERSION: v1.0
+# VERSION: v1.1
 # DESCRIPTION: Ensures a clean Unraid shutdown by flushing databases, unmounting 
 #              complex bind-mounts, terminating Rclone, and exporting ZFS pools.
 # ======================================================================================
@@ -26,7 +26,7 @@ CLOUD_MOUNTS=(
 # Fixed: Added explicit associative array declaration
 declare -A BINDS
 BINDS=(
-    ["/mnt/computers/streaming/media/plex/Sync+"]="/mnt/cache/appdata/dockers/plex/Library/Application Support/Plex Media Server/Cache/Transcode/Sync+"
+    ["/mnt/computers/media/plex/Sync+"]="/mnt/cache/appdata/dockers/plex/Library/Application Support/Plex Media Server/Cache/Transcode/Sync+"
 )
 
 # ZFS POOLS TO EXPORT
