@@ -126,6 +126,11 @@ rm -rf "$MEDIA_ROOT/tv-remote/_Test"
 You should see a `MOCK` entry. Flip `DRY_RUN_GLOBAL=N` only after the audit log
 confirms correct behavior — then `systemctl restart nzbdav-symlink-cleanup.timer`.
 
+> **Behavior note:** the Linux Sentinel sends a `notify` alert when the circuit breaker
+> trips (`TOTAL_BROKEN_GLOBAL > MAX_BROKEN_BEFORE_HALT`). The Unraid version logs this
+> but does not notify. This is an intentional improvement — it makes the "Sentinel
+> Locked" state visible via your configured notification backend.
+
 ### 4. Janitor (shutdown)
 
 Easiest: reboot the host. Watch `/var/log/dumb-scripts/shutdown.log` next boot.

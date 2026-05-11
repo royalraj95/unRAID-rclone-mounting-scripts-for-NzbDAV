@@ -137,9 +137,11 @@ for ENTRY in "${LIBRARIES[@]}"; do
             ((LIB_BROKEN_COUNT++))
             [ "$LIB_BROKEN_COUNT" -ge "$MAX_BROKEN_BEFORE_HALT" ] && break
         done < <(
-            eval "find \"$LIB_PATH\" $DEPTH_ARGS -type l \
-                \\( -lname \"${NZB_LINK_PREFIX}*\" -o -lname \"${DEC_LINK_PREFIX}*\" \\) \
-                -printf '%p\t%l\n' 2>/dev/null" | \
+            # $DEPTH_ARGS is intentionally unquoted so bash word-splits it into separate flags.
+            # shellcheck disable=SC2086
+            find "$LIB_PATH" $DEPTH_ARGS -type l \
+                \( -lname "${NZB_LINK_PREFIX}*" -o -lname "${DEC_LINK_PREFIX}*" \) \
+                -printf '%p\t%l\n' 2>/dev/null | \
             awk -v pack_file="$PACK_LIST" \
                 -v nzb_file="$NZB_LIST" \
                 -v dec_marker="realdebrid/__all__/" \

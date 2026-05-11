@@ -26,7 +26,6 @@ SCRIPT_VERSION="v1.0-DUMB-LINUX"
 : "${PRIME_MAX_TIME:=60}"
 : "${EXCLUDE_DIRS:=}"
 : "${EXCLUDE_EXTS:=.srt .ass .vtt}"
-: "${LOCAL_MEDIA_PATH:=$MEDIA_ROOT}"
 
 STATE_FILE="$STATE_DIR/prime_state.db"
 LOG_FILE="$LOG_DIR/heartbeat.log"
@@ -47,7 +46,7 @@ echo ""
 echo "[MOUNT PATHS]"
 echo "NzbDAV (host):       $NZB_MOUNT"
 echo "Decypharr (host):    $DEC_MOUNT"
-echo "Media Library:       $LOCAL_MEDIA_PATH"
+echo "Media Library:       $MEDIA_ROOT"
 echo ""
 echo "[DOCKER SETTINGS]"
 echo "Foundation:          $DUMB_CONTAINER"
@@ -265,6 +264,9 @@ if [[ "$TRIGGER_HARD_RESET" == "true" ]]; then
     log "Stopping $DUMB_CONTAINER..."
     docker stop "$DUMB_CONTAINER" > /dev/null 2>&1
 
+    # Cache wipe only when explicitly requested (HARD_RESET=Y). Auto-triggered nuclear
+    # resets (MAX_FAILURES reached) restart the container but intentionally skip the
+    # wipe to preserve warm cache across transient failures.
     if [[ "$HARD_RESET" == "Y" ]] && [[ -d "$RCLONE_CACHE_DIR" ]]; then
         log "Wiping rclone VFS cache at $RCLONE_CACHE_DIR..."
         rm -rf "${RCLONE_CACHE_DIR:?}"/*
@@ -304,7 +306,7 @@ LAST_RUN_TS=${LAST_PRIMED_TS:-0}
 LMP_RUN_COUNT=0
 CUR_TOTAL_LMP=${TOTAL_LMP_PRIMED:-0}
 
-log "Checking $LOCAL_MEDIA_PATH for new files..."
+log "Checking $MEDIA_ROOT for new files..."
 FIND_EXCLUDES=""
 for d in $EXCLUDE_DIRS; do
     FIND_EXCLUDES="$FIND_EXCLUDES ! -path \"*/${d#/}/*\""
@@ -313,11 +315,11 @@ for e in $EXCLUDE_EXTS; do
     FIND_EXCLUDES="$FIND_EXCLUDES ! -name \"*$e\""
 done
 
-eval "nice -n 19 ionice -c 3 find \"$LOCAL_MEDIA_PATH\" -type l $FIND_EXCLUDES -newermt \"@$LAST_RUN_TS\" -exec ls -d {} + > /dev/null 2>&1"
+eval "nice -n 19 ionice -c 3 find \"$MEDIA_ROOT\" -type l $FIND_EXCLUDES -newermt \"@$LAST_RUN_TS\" -exec ls -d {} + > /dev/null 2>&1"
 
 if [[ "${ALL_HISTORICAL_PRIMED:-}" != "TRUE" ]]; then
     log "Resuming historical prime for Media Path..."
-    mapfile -t LMP_TARGETS < <(eval "nice -n 19 ionice -c 3 find \"$LOCAL_MEDIA_PATH\" -type l $FIND_EXCLUDES -not -newermt \"@${HISTORICAL_MARKER:-$(date +%s)}\" -printf \"%T@ %p\n\" | sort -rn | cut -d' ' -f2-")
+    mapfile -t LMP_TARGETS < <(eval "nice -n 19 ionice -c 3 find \"$MEDIA_ROOT\" -type l $FIND_EXCLUDES -not -newermt \"@${HISTORICAL_MARKER:-$(date +%s)}\" -printf \"%T@ %p\n\" | sort -rn | cut -d' ' -f2-")
 
     if [ ${#LMP_TARGETS[@]} -gt 0 ]; then
         for file in "${LMP_TARGETS[@]}"; do

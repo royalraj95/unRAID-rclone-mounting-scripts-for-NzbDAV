@@ -22,12 +22,19 @@ LOG_FILE="$LOG_DIR/shutdown.log"
 LOCK_DIR="$STATE_DIR"
 
 # Optional local bind bridges to unmount before container teardown.
-# Populate in config.env if needed (newline-separated "source>dest" pairs in $JANITOR_BINDS).
+# Set JANITOR_BINDS in config.env as semicolon-separated "source>dest" pairs.
+# Semicolon is required (not newline) for systemd EnvironmentFile= compatibility.
+# Example: JANITOR_BINDS="/mnt/sync>/var/lib/plex/transcode;/mnt/bar>/var/lib/other"
 declare -A BINDS=()
 if [ -n "${JANITOR_BINDS:-}" ]; then
-    while IFS='>' read -r src dst; do
+    IFS=';' read -ra _pairs <<< "$JANITOR_BINDS"
+    for _pair in "${_pairs[@]}"; do
+        IFS='>' read -r src dst <<< "$_pair"
+        src="${src# }"; src="${src% }"   # trim surrounding spaces
+        dst="${dst# }"; dst="${dst% }"
         [ -n "$src" ] && [ -n "$dst" ] && BINDS["$src"]="$dst"
-    done <<< "$JANITOR_BINDS"
+    done
+    unset _pairs _pair src dst
 fi
 
 log() { log_step "$1" "$LOG_FILE"; }
@@ -92,6 +99,8 @@ log "Purging script lock files..."
 rm -f "$LOCK_DIR"/janitor_*.lock "$LOCK_DIR"/heartbeat_*.lock
 log "SUCCESS: Lock files purged. Environment clear for shutdown."
 
+# Best-effort: network may already be down at this point; HTTP backends (ntfy/discord/apprise)
+# will fail gracefully and fall back to syslog. Only the "logger" backend is guaranteed here.
 notify "Shutdown Prepared" "DUMB stack stopped, debrid bind released, all containers clear." "normal"
 
 echo "--- JANITOR WORK COMPLETE ---" | tee -a "$LOG_FILE"

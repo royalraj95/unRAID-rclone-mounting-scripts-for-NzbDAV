@@ -4,7 +4,10 @@ Documentation=https://github.com/royalraj95/unRAID-rclone-mounting-scripts-for-N
 DefaultDependencies=no
 Before=shutdown.target reboot.target halt.target
 After=docker.service
-Requires=docker.service
+# Wants= (not Requires=): janitor must still run at shutdown even if docker.service
+# failed earlier in the boot, so we don't want a hard dependency that could make
+# this service inactive and skip ExecStop= entirely.
+Wants=docker.service
 Conflicts=shutdown.target reboot.target halt.target
 
 [Service]
