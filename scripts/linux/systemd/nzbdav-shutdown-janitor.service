@@ -1,0 +1,19 @@
+[Unit]
+Description=DUMB shutdown janitor — gracefully stop DUMB-2026 + release debrid bind
+Documentation=https://github.com/royalraj95/unRAID-rclone-mounting-scripts-for-NzbDAV
+DefaultDependencies=no
+Before=shutdown.target reboot.target halt.target
+After=docker.service
+Requires=docker.service
+Conflicts=shutdown.target reboot.target halt.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/dumb-scripts/config.env
+ExecStart=/bin/true
+ExecStop=/opt/dumb-scripts/shutdown-janitor.sh
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target

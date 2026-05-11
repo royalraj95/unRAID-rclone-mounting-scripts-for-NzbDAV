@@ -1,0 +1,13 @@
+[Unit]
+Description=NzbDAV/Decypharr mount heartbeat (DUMB)
+Documentation=https://github.com/royalraj95/unRAID-rclone-mounting-scripts-for-NzbDAV
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/dumb-scripts/config.env
+ExecStart=/opt/dumb-scripts/mount-heartbeat.sh
+TimeoutStartSec=10min
+Nice=10
+IOSchedulingClass=idle

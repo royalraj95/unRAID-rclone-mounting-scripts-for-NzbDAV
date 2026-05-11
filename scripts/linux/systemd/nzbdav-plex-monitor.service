@@ -1,0 +1,11 @@
+[Unit]
+Description=Plex mount monitor (DUMB) — stops/starts Plex on debrid mount loss
+Documentation=https://github.com/royalraj95/unRAID-rclone-mounting-scripts-for-NzbDAV
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/dumb-scripts/config.env
+ExecStart=/opt/dumb-scripts/plex-mount-monitor.sh
+TimeoutStartSec=5min

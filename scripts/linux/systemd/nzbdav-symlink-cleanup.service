@@ -1,0 +1,13 @@
+[Unit]
+Description=Symlink Sentinel (DUMB) — broken-symlink reconciliation
+Documentation=https://github.com/royalraj95/unRAID-rclone-mounting-scripts-for-NzbDAV
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/dumb-scripts/config.env
+ExecStart=/opt/dumb-scripts/symlink-cleanup.sh
+TimeoutStartSec=30min
+Nice=15
+IOSchedulingClass=idle
