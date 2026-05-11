@@ -1,0 +1,291 @@
+#!/bin/bash
+# ======================================================================================
+# SCRIPT: Symlink Sentinel (v1.0RC1-DUMB)
+# DESCRIPTION: Detects broken symlinks pointing at DUMB-2026's debrid mounts,
+#              calculates library health, and triggers DUMB's internal *Arrs + Plex refresh.
+#
+# NOTE ON PATHS: Symlinks created by DUMB's internal *Arrs use the CONTAINER-SIDE path
+# (/mnt/debrid/...) because the *Arr containers bind /mnt/user/data/remote as /mnt/debrid,
+# the same as DUMB does. NZB_MOUNT and DEC_MOUNT here must match the target path written
+# INTO the symlink, not the host-side path.
+#
+# NOTE ON *ARR INSTANCES: This Sentinel calls DUMB's INTERNAL *Arrs (exposed via Docker
+# port mappings on the host). The independent binhex *Arr stack manages local libraries
+# (tv/, movies-hd/, etc.) and has no relationship to the -remote symlink folders.
+# ======================================================================================
+
+# --- 1. MEDIA SERVER CONFIG ---
+# Replace placeholders with your own host/IP, port mappings, and API tokens.
+PLEX_URL="http://<UNRAID_HOST_OR_IP>:<PLEX_PORT>"
+PLEX_TOKEN="<YOUR_PLEX_TOKEN>"                # Plex WebUI → any item → Get Info → View XML → X-Plex-Token in URL
+
+EMBY_URL=""                                # Disabled — leave blank
+EMBY_API=""
+
+# --- 2. PROVIDER DEFINITIONS ---
+# DUMB's internal *Arrs — host-port mappings exposed by DUMB-2026.
+# NOT the binhex *Arrs (binhex-sonarr, binhex-radarr-UHD, etc. are independent).
+# API keys: each app's WebUI → Settings → General → API Key.
+
+SONARR_HD_URL="http://<UNRAID_HOST_OR_IP>:<SONARR_HD_PORT>"
+SONARR_HD_API="<YOUR_SONARR_HD_API_KEY>"
+
+SONARR_4K_URL="http://<UNRAID_HOST_OR_IP>:<SONARR_4K_PORT>"
+SONARR_4K_API="<YOUR_SONARR_4K_API_KEY>"
+
+RADARR_HD_URL="http://<UNRAID_HOST_OR_IP>:<RADARR_HD_PORT>"
+RADARR_HD_API="<YOUR_RADARR_HD_API_KEY>"
+
+RADARR_4K_URL="http://<UNRAID_HOST_OR_IP>:<RADARR_4K_PORT>"
+RADARR_4K_API="<YOUR_RADARR_4K_API_KEY>"
+
+# Disabled
+LIDARR_URL=""; LIDARR_API=""
+SPORTARR_URL=""; SPORTARR_API=""
+
+# --- 3. SAFETY & PACE CONFIGURATION ---
+DRY_RUN_GLOBAL="Y"               # START IN DRY RUN — flip to N after confirming audit log looks right
+MAX_BROKEN_BEFORE_HALT=150       # CIRCUIT BREAKER: halt if > X broken links found (likely a mount problem)
+ROLLING_24H_LIMIT=200            # FUEL GAUGE: max total deletions in 24 hours across all runs
+UPTIME_MATURITY_REQUIRED=3600    # Seconds of mount stability before Sentinel will act (prevents startup race)
+DELETES_PER_RUN=5                # Max deletions per script run (tune up once stable)
+
+# --- 4. LIBRARY MAPPING ---
+# Format: "Path|Name|Arr_Key|Mode|Notify_Type|Media_ID|Min_Depth|Max_Depth"
+#
+# Arr_Key must match a declared variable prefix above:
+#   SONARR_HD → SONARR_HD_URL + SONARR_HD_API → RescanSeries
+#   RADARR_4K → RADARR_4K_URL + RADARR_4K_API → RefreshMovie (any key containing RADARR)
+#
+# Media_ID = Plex library section key:
+#   key=1 Movies-4k | key=2 Movies-HD | key=4 TV Shows | key=10 TV Shows-4K
+#
+# Only scan -remote libraries (DUMB-managed symlinks). Do NOT add local folders
+# (tv/, movies-hd/, etc.) — those are managed by the independent binhex stack.
+
+LIBRARIES=(
+    "/mnt/user/data/media/tv-remote|TV Shows|SONARR_HD|LIVE|PLEX|4|3|4"
+    "/mnt/user/data/media/tv-remote-4k|TV Shows 4K|SONARR_4K|LIVE|PLEX|10|3|4"
+    "/mnt/user/data/media/movies-hd-remote|Movies HD|RADARR_HD|LIVE|PLEX|2|2|3"
+    "/mnt/user/data/media/movies-uhd-remote|Movies 4K|RADARR_4K|LIVE|PLEX|1|2|3"
+)
+
+# --- 5. PATHS & FILES ---
+STATE_DB="/mnt/user/appdata/other/scripts/dumb-2026/sentinel_state.db"
+AUDIT_LOG="/mnt/user/appdata/other/scripts/dumb-2026/sentinel_audit.log"
+HOLD_FILE="/mnt/user/appdata/other/scripts/dumb-2026/SENTINEL_HOLD.txt"
+PRIME_STATE="/mnt/user/appdata/other/scripts/dumb-2026/prime_state.db"
+
+# Symlink target prefix (container-side) — must match what DUMB's *Arrs write into symlinks.
+# Verified via readlink: targets are /mnt/debrid/decypharr/realdebrid/__all__/...
+NZB_MOUNT="/mnt/debrid/nzbdav"
+DEC_MOUNT="/mnt/debrid/decypharr"
+
+# Path translation: symlink targets use the container-side prefix /mnt/debrid.
+# The host-side equivalent is /mnt/user/data/remote (via the rshared bind).
+# Used to locate __all__ for the pre-scan pack index.
+RSHARED_CONTAINER="/mnt/debrid"
+RSHARED_HOST="/mnt/user/data/remote"
+
+# Minimum number of packs that must be returned from decypharr's __all__ before
+# the Sentinel will act. Protects against a momentarily stale/empty fuse index
+# causing every symlink to appear broken and triggering mass deletion.
+MIN_PACKS_SANITY=100
+
+# --------------------------------------------------------------------------------------
+# 6. MAIN SCRIPT — DO NOT CHANGE BELOW HERE
+# --------------------------------------------------------------------------------------
+
+log_it() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
+touch "$STATE_DB"
+[ ! -f "$AUDIT_LOG" ] && touch "$AUDIT_LOG"
+
+echo "------------------------------------------------------------"
+echo " SENTINEL CONFIGURATION"
+echo "------------------------------------------------------------"
+echo " Deletes Per Run:   $DELETES_PER_RUN"
+echo " Circuit Breaker:   $MAX_BROKEN_BEFORE_HALT"
+echo " Rolling 24h Limit: $ROLLING_24H_LIMIT"
+echo " Dry Run:           $DRY_RUN_GLOBAL"
+echo " NZB prefix:        $NZB_MOUNT"
+echo " DEC prefix:        $DEC_MOUNT"
+echo "------------------------------------------------------------"
+
+# 1. Maturity Check
+if [ -f "$PRIME_STATE" ]; then
+    NZB_START_TS=$(grep "NZB_START_TS" "$PRIME_STATE" | cut -d= -f2 | tr -d '"')
+    if [ -n "$NZB_START_TS" ]; then
+        UPTIME=$(( $(date +%s) - NZB_START_TS ))
+        if [ "$UPTIME" -lt "$UPTIME_MATURITY_REQUIRED" ]; then
+            log_it "STABILITY: Mount is fresh ($((UPTIME/60)) mins). Postponing."
+            exit 0
+        fi
+    fi
+fi
+
+# 2. PRE-SCAN: Build ground-truth indexes for both mounts (no per-file stats)
+PACK_LIST=$(mktemp)
+NZB_LIST=$(mktemp)
+
+# Decypharr: one readdir of __all__ — pack DIRECTORY names (torrent-level granularity).
+# Decypharr serves this from its in-process torrent registry; one fuse readdir operation.
+DEC_ALL_PATH="${RSHARED_HOST}/decypharr/realdebrid/__all__"
+log_it "PRE-SCAN: Indexing decypharr packs from $DEC_ALL_PATH..."
+find "$DEC_ALL_PATH" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort -u > "$PACK_LIST"
+DEC_PACK_COUNT=$(wc -l < "$PACK_LIST")
+
+if (( DEC_PACK_COUNT < MIN_PACKS_SANITY )); then
+    log_it "ABORT: Only $DEC_PACK_COUNT packs returned — decypharr index may be stale or mount is down. Exiting safely."
+    rm -f "$PACK_LIST" "$NZB_LIST"; exit 1
+fi
+
+# NzbDAV: ONE readdir of completed-symlinks — category dir names only (-maxdepth 1).
+# -maxdepth 3 hung because each subdir triggers an additional WebDAV PROPFIND call.
+# -maxdepth 1 = one PROPFIND, identical cost to decypharr's __all__.
+# Category-level granularity is sufficient: NzbDAV content is downloaded to disk and
+# rarely deleted at the individual file level.
+# Safety: if mount is down, NZB_LIST stays empty — awk skips NzbDAV checks.
+NZB_CS_PATH="${RSHARED_HOST}/nzbdav/completed-symlinks"
+log_it "PRE-SCAN: Indexing NzbDAV categories from $NZB_CS_PATH..."
+find "$NZB_CS_PATH" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort -u > "$NZB_LIST"
+NZB_CAT_COUNT=$(wc -l < "$NZB_LIST")
+
+log_it "PRE-SCAN: $DEC_PACK_COUNT decypharr packs + $NZB_CAT_COUNT NzbDAV categories indexed. Starting scan..."
+
+# 3. SCAN
+TOTAL_BROKEN_GLOBAL=0
+CANDIDATES=()
+
+for ENTRY in "${LIBRARIES[@]}"; do
+    IFS='|' read -r LIB_PATH LIB_NAME LIB_KEY LIB_MODE LIB_NOTIFY LIB_ID LIB_MIN LIB_MAX <<< "$ENTRY"
+    if [ -d "$LIB_PATH" ]; then
+        log_it ">> SCANNING: $LIB_NAME [$LIB_MODE]"
+
+        DEPTH_ARGS=""
+        [ -n "$LIB_MIN" ] && DEPTH_ARGS="$DEPTH_ARGS -mindepth $LIB_MIN"
+        [ -n "$LIB_MAX" ] && DEPTH_ARGS="$DEPTH_ARGS -maxdepth $LIB_MAX"
+
+        # find -printf '%p\t%l\n' reads only symlink inodes — zero fuse contact.
+        # awk loads the pack list once, extracts the pack name from each target string,
+        # and outputs only the links whose pack is absent from the available set.
+        # NzbDAV targets (no realdebrid/__all__/ in path) are silently skipped —
+        # NzbDAV content is kept permanently; mount-level failures are handled by the Heartbeat.
+        LIB_BROKEN_COUNT=0
+        while IFS= read -r broken_link; do
+            CANDIDATES+=("$broken_link|$LIB_NAME|$LIB_KEY|$LIB_MODE|$LIB_NOTIFY|$LIB_ID")
+            ((LIB_BROKEN_COUNT++))
+            [ "$LIB_BROKEN_COUNT" -ge "$MAX_BROKEN_BEFORE_HALT" ] && break
+        done < <(
+            find "$LIB_PATH" $DEPTH_ARGS -type l \
+                \( -lname "${NZB_MOUNT}*" -o -lname "${DEC_MOUNT}*" \) \
+                -printf '%p\t%l\n' 2>/dev/null | \
+            awk -v pack_file="$PACK_LIST" \
+                -v nzb_file="$NZB_LIST" \
+                -v dec_marker="realdebrid/__all__/" \
+                -v nzb_marker="nzbdav/completed-symlinks/" '
+                BEGIN {
+                    while ((getline p < pack_file) > 0) dec_avail[p] = 1
+                    close(pack_file)
+                    while ((getline f < nzb_file) > 0) nzb_avail[f] = 1
+                    close(nzb_file)
+                }
+                {
+                    n = split($0, parts, "\t")
+                    link = parts[1]; target = parts[2]
+
+                    # Decypharr: extract pack name from __all__/PackName/file path
+                    pos = index(target, dec_marker)
+                    if (pos > 0) {
+                        rest = substr(target, pos + length(dec_marker))
+                        slash = index(rest, "/")
+                        pack = (slash > 0) ? substr(rest, 1, slash - 1) : rest
+                        if (pack != "" && !(pack in dec_avail)) print link
+                        next
+                    }
+
+                    # NzbDAV: extract category name only (first component after completed-symlinks/).
+                    # NZB_LIST has category dir names only (-maxdepth 1, one PROPFIND call).
+                    # Skip if NZB_LIST is empty (mount down) — safer than mass-flagging.
+                    pos = index(target, nzb_marker)
+                    if (pos > 0 && length(nzb_avail) > 0) {
+                        rest = substr(target, pos + length(nzb_marker))
+                        slash = index(rest, "/")
+                        category = (slash > 0) ? substr(rest, 1, slash - 1) : rest
+                        if (category != "" && !(category in nzb_avail)) print link
+                    }
+                }
+            '
+        )
+        log_it "  Broken: $LIB_BROKEN_COUNT"
+
+        TOTAL_BROKEN_GLOBAL=$((TOTAL_BROKEN_GLOBAL + LIB_BROKEN_COUNT))
+    fi
+done
+
+# 3. CIRCUIT BREAKER
+if [ "$DRY_RUN_GLOBAL" = "N" ] && [ "$TOTAL_BROKEN_GLOBAL" -gt "$MAX_BROKEN_BEFORE_HALT" ]; then
+    log_it "CRITICAL: Broken links ($TOTAL_BROKEN_GLOBAL) exceeds threshold ($MAX_BROKEN_BEFORE_HALT)."
+    echo "$TOTAL_BROKEN_GLOBAL broken links found. Sentinel Locked." > "$HOLD_FILE"
+    exit 1
+fi
+
+# 4. ROLLING 24H TALLY
+NOW=$(date +%s)
+VALID_ENTRIES=$(grep -E '^[0-9]+$' "$STATE_DB" | awk -v limit="$((NOW - 86400))" '$1 > limit')
+echo "$VALID_ENTRIES" > "$STATE_DB"
+ROLLING_COUNT=$(echo "$VALID_ENTRIES" | wc -w)
+
+processed_this_run=0
+declare -A LIB_SUMMARY
+
+# 5. EXECUTION
+for ENTRY in "${CANDIDATES[@]}"; do
+    [ "$processed_this_run" -ge "$DELETES_PER_RUN" ] || [ "$ROLLING_COUNT" -ge "$ROLLING_24H_LIMIT" ] && break
+
+    IFS='|' read -r LINK LIB_NAME LIB_KEY LIB_MODE LIB_NOTIFY LIB_ID <<< "$ENTRY"
+
+    if [ "$LIB_MODE" = "LIVE" ] && [ "$DRY_RUN_GLOBAL" = "N" ]; then
+        if rm -f "$LINK"; then
+            # Notify *Arr (DUMB internal instance)
+            CMD_NAME="RescanSeries"; [[ "${LIB_KEY}" == *"RADARR"* ]] && CMD_NAME="RefreshMovie"
+            URL_VAR="${LIB_KEY}_URL"; API_VAR="${LIB_KEY}_API"
+            if [ -n "${!URL_VAR}" ] && [ -n "${!API_VAR}" ]; then
+                curl -s -X POST "${!URL_VAR}/api/v3/command" \
+                    -H "X-Api-Key: ${!API_VAR}" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"name\": \"$CMD_NAME\"}" > /dev/null
+            fi
+
+            # Notify Plex
+            if [ "$LIB_NOTIFY" = "PLEX" ] && [ -n "$LIB_ID" ] && [ -n "$PLEX_TOKEN" ]; then
+                curl -s -G "${PLEX_URL}/library/sections/${LIB_ID}/refresh" \
+                    -d "X-Plex-Token=${PLEX_TOKEN}" > /dev/null
+            elif [ "$LIB_NOTIFY" = "EMBY" ] && [ -n "$EMBY_URL" ]; then
+                curl -s -X POST "${EMBY_URL}/Library/Refresh?api_key=${EMBY_API}" > /dev/null
+            fi
+
+            echo "$NOW" >> "$STATE_DB"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] DELETED [$LIB_NAME]: $LINK" >> "$AUDIT_LOG"
+            LIB_SUMMARY["$LIB_NAME"]=$(( ${LIB_SUMMARY["$LIB_NAME"]:-0} + 1 ))
+            ((processed_this_run++))
+            ((ROLLING_COUNT++))
+        fi
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] MOCK    [$LIB_NAME]: $LINK" >> "$AUDIT_LOG"
+        LIB_SUMMARY["$LIB_NAME"]=$(( ${LIB_SUMMARY["$LIB_NAME"]:-0} + 1 ))
+        ((processed_this_run++))
+        ((ROLLING_COUNT++))
+    fi
+done
+
+# 6. OUTPUT SUMMARY
+echo "------------------------------------------------------------"
+for LIB in "${!LIB_SUMMARY[@]}"; do
+    log_it "[$LIB] Processed: ${LIB_SUMMARY[$LIB]}"
+done
+
+log_it "SENTINEL SUMMARY: Processed: $processed_this_run | 24h Tally: $ROLLING_COUNT | Total broken found: $TOTAL_BROKEN_GLOBAL | DEC packs: $DEC_PACK_COUNT | NZB categories: $NZB_CAT_COUNT"
+log_it "Detailed paths recorded in $AUDIT_LOG"
+echo "------------------------------------------------------------"
+rm -f "$PACK_LIST" "$NZB_LIST"
+exit 0
