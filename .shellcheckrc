@@ -1,0 +1,6 @@
+# SC1090: sourcing a non-constant path. We deliberately source state
+#         files whose paths are user-configurable.
+# SC2034: "appears unused". Many config vars (SONARR_HD_URL etc.) are
+#         resolved via indirect expansion ${!URL_VAR}, which shellcheck
+#         can't trace.
+disable=SC1090,SC2034

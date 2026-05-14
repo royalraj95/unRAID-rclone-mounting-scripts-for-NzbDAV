@@ -1,0 +1,3 @@
+#!/bin/bash
+echo "fusermount $*" >> "$MOCK_CALL_LOG"
+exit 0

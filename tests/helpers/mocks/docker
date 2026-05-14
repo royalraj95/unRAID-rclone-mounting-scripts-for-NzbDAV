@@ -1,0 +1,40 @@
+#!/bin/bash
+# Mock for `docker`. Records every call to $MOCK_CALL_LOG and returns
+# canned responses for `docker inspect` based on $MOCK_DIR contents.
+echo "docker $*" >> "$MOCK_CALL_LOG"
+
+case "$1" in
+    inspect)
+        # docker inspect -f '{{.State.Running}}' <container>
+        # docker inspect -f '{{.State.Paused}}' <container>
+        # Last positional arg is the container name.
+        name="${@: -1}"
+        # Sequenced override: $MOCK_DIR/docker_inspect_<name>.seq is a
+        # list of values, one per line, consumed left-to-right.
+        # Static override: $MOCK_DIR/docker_inspect_<name> is a single
+        # value reused on every call. Default: "true".
+        seq="$MOCK_DIR/docker_inspect_$name.seq"
+        if [ -f "$seq" ]; then
+            head -1 "$seq"
+            tail -n +2 "$seq" > "$seq.tmp" && mv "$seq.tmp" "$seq"
+        elif [ -f "$MOCK_DIR/docker_inspect_$name" ]; then
+            cat "$MOCK_DIR/docker_inspect_$name"
+        else
+            echo "true"
+        fi
+        ;;
+    ps)
+        # docker ps -q → list of running container IDs.
+        if [ -f "$MOCK_DIR/docker_ps" ]; then
+            cat "$MOCK_DIR/docker_ps"
+        fi
+        ;;
+    restart|stop|start)
+        # No-op — invocation already recorded above.
+        :
+        ;;
+    *)
+        :
+        ;;
+esac
+exit 0

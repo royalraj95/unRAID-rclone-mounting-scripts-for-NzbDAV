@@ -1,0 +1,14 @@
+#!/bin/bash
+# Mock for `mountpoint`. Returns 0 (yes) or 1 (no) based on $MOCK_DIR.
+# Write "yes" or "no" to $MOCK_DIR/mountpoint_<basename> to control.
+echo "mountpoint $*" >> "$MOCK_CALL_LOG"
+
+# Last positional arg is the path being checked (after any -q / -- flags).
+path="${@: -1}"
+key="mountpoint_$(echo "$path" | tr '/' '_')"
+
+if [ -f "$MOCK_DIR/$key" ] && [ "$(cat "$MOCK_DIR/$key")" = "yes" ]; then
+    exit 0
+else
+    exit 1
+fi
