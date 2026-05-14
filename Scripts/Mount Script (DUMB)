@@ -360,7 +360,6 @@ fi
 
 # --- SECTION 4: PRIMING & RESTORATION ---
 log_step "INITIATING: Intelligent Priming (Library Only)..."
-[ -f "$STATE_FILE" ] && source "$STATE_FILE"
 
 START_TIME=$(date +%s)
 LAST_RUN_TS=${LAST_PRIMED_TS:-0}
@@ -423,7 +422,6 @@ fi
 
 # --- SECTION 6: FINAL SUMMARY ---
 log_step "FINALIZING: Generating environment report..."
-[ -f "$STATE_FILE" ] && source "$STATE_FILE"
 
 CUR_LOAD=$(awk '{print $1}' /proc/loadavg)
 RAM_TOTAL=$(grep MemTotal /proc/meminfo | awk '{print $2}')
