@@ -192,8 +192,7 @@ if [[ "$HARD_RESET" == "N" ]]; then
             COOLDOWN_REMAINING=$(( RECOVERY_COOLDOWN_SEC - (NOW_TS - LAST_RESTART) ))
 
             if [[ "$LAST_RESTART" -gt 0 ]] && [[ "$COOLDOWN_REMAINING" -gt 0 ]]; then
-                log_step "[!] COOLDOWN: Skipping Decypharr restart (${COOLDOWN_REMAINING}s remaining of ${RECOVERY_COOLDOWN_SEC}s window)."
-                D_CUR_FAIL=$((D_CUR_FAIL + 1))
+                log_step "[!] COOLDOWN: Skipping Decypharr restart (${COOLDOWN_REMAINING}s remaining of ${RECOVERY_COOLDOWN_SEC}s window, fail count $D_CUR_FAIL/$MAX_FAILURES)."
             else
                 log_step "Entering Recovery..."
 
@@ -255,6 +254,7 @@ if [[ "$HARD_RESET" == "N" ]] && [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
 
     log_step "FIX: Restarting $DUMB_CONTAINER..."
     docker restart "$DUMB_CONTAINER" > /dev/null 2>&1
+    FOUNDATION_LAST_RESTART_TS=$(date +%s)
 
     COUNT=0
     while [ $COUNT -lt 5 ]; do
