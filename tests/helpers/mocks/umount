@@ -1,0 +1,3 @@
+#!/bin/bash
+echo "umount $*" >> "$MOCK_CALL_LOG"
+exit 0

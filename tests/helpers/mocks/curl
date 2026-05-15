@@ -1,0 +1,4 @@
+#!/bin/bash
+# Mock for `curl`. Records the call and exits 0. No response body.
+echo "curl $*" >> "$MOCK_CALL_LOG"
+exit 0

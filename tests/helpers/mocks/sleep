@@ -1,0 +1,5 @@
+#!/bin/bash
+# Mock for `sleep`. No-op so tests don't take minutes. Records the call
+# so tests can assert on intended sleep durations if needed.
+echo "sleep $*" >> "$MOCK_CALL_LOG"
+exit 0
