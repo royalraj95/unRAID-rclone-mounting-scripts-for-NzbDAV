@@ -45,7 +45,8 @@ SPORTARR_URL=""; SPORTARR_API=""
 
 # --- 3. SAFETY & PACE CONFIGURATION ---
 DRY_RUN_GLOBAL="Y"               # START IN DRY RUN — flip to N after confirming audit log looks right
-MAX_BROKEN_BEFORE_HALT=150       # CIRCUIT BREAKER: halt if > X broken links found (likely a mount problem)
+MAX_BROKEN_PER_LIB=150           # Per-library scan cap: stop counting after this many per library
+MAX_BROKEN_BEFORE_HALT=500       # CIRCUIT BREAKER: abort if total broken across all libraries exceeds this
 ROLLING_24H_LIMIT=200            # FUEL GAUGE: max total deletions in 24 hours across all runs
 UPTIME_MATURITY_REQUIRED=3600    # Seconds of mount stability before Sentinel will act (prevents startup race)
 DELETES_PER_RUN=5                # Max deletions per script run (tune up once stable)
@@ -104,6 +105,7 @@ echo "------------------------------------------------------------"
 echo " SENTINEL CONFIGURATION"
 echo "------------------------------------------------------------"
 echo " Deletes Per Run:   $DELETES_PER_RUN"
+echo " Per-Lib Cap:       $MAX_BROKEN_PER_LIB"
 echo " Circuit Breaker:   $MAX_BROKEN_BEFORE_HALT"
 echo " Rolling 24h Limit: $ROLLING_24H_LIMIT"
 echo " Dry Run:           $DRY_RUN_GLOBAL"
@@ -174,7 +176,7 @@ for ENTRY in "${LIBRARIES[@]}"; do
         while IFS= read -r broken_link; do
             CANDIDATES+=("$broken_link|$LIB_NAME|$LIB_KEY|$LIB_MODE|$LIB_NOTIFY|$LIB_ID")
             ((LIB_BROKEN_COUNT++))
-            [ "$LIB_BROKEN_COUNT" -ge "$MAX_BROKEN_BEFORE_HALT" ] && break
+            [ "$LIB_BROKEN_COUNT" -ge "$MAX_BROKEN_PER_LIB" ] && break
         done < <(
             find "$LIB_PATH" $DEPTH_ARGS -type l \
                 \( -lname "${NZB_MOUNT}*" -o -lname "${DEC_MOUNT}*" \) \
