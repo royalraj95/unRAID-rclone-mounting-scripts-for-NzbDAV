@@ -1,0 +1,6 @@
+#!/bin/bash
+# Mock for the Unraid notify binary. Scripts call it via either
+# /usr/local/emhttp/webGui/scripts/notify (absolute path, sed-rewritten
+# in setup) or just `notify` (PATH-resolved). Records the invocation.
+echo "notify $*" >> "$MOCK_CALL_LOG"
+exit 0
