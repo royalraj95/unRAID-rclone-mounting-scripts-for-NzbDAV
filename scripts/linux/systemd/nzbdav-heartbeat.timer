@@ -1,0 +1,13 @@
+[Unit]
+Description=Run NzbDAV/Decypharr heartbeat every 5 minutes
+Documentation=https://github.com/royalraj95/unRAID-rclone-mounting-scripts-for-NzbDAV
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+Unit=nzbdav-heartbeat.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Plex mount monitor every 2 minutes
+Documentation=https://github.com/royalraj95/unRAID-rclone-mounting-scripts-for-NzbDAV
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=10s
+Persistent=true
+Unit=nzbdav-plex-monitor.service
+
+[Install]
+WantedBy=timers.target
