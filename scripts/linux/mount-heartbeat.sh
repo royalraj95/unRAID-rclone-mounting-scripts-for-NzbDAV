@@ -91,6 +91,7 @@ fi
 # shellcheck disable=SC1090
 [ -f "$STATE_FILE" ] && . "$STATE_FILE"
 N_CUR_FAIL=${N_FAIL_COUNT:-0}
+FOUNDATION_LAST_RESTART_TS=${FOUNDATION_LAST_RESTART_TS:-0}
 NZB_VALIDATION_SUBFOLDER="$NZB_MOUNT/completed-symlinks"
 NZB_MOUNT_ALIVE=false
 DEC_MOUNT_ALIVE=false
@@ -147,35 +148,44 @@ if [[ "$HARD_RESET" == "N" ]]; then
         fi
 
         if [[ "$DEC_MOUNT_ALIVE" == "false" ]]; then
-            log "[!] Failed: Decypharr is DOWN. Entering Recovery..."
+            log "[!] Failed: Decypharr is DOWN."
+            NOW_TS=$(date +%s)
+            COOLDOWN_REMAINING=$(( RECOVERY_COOLDOWN_SEC - (NOW_TS - FOUNDATION_LAST_RESTART_TS) ))
 
-            for container in $ALL_CONSUMERS; do
-                if [ "$(container_running "$container")" == "true" ]; then
-                    log "Stopping Consumer: $container..."
-                    docker stop "$container" > /dev/null 2>&1
+            if [[ "$FOUNDATION_LAST_RESTART_TS" -gt 0 ]] && [[ "$COOLDOWN_REMAINING" -gt 0 ]]; then
+                log "[!] COOLDOWN: Skipping Decypharr recovery restart (${COOLDOWN_REMAINING}s remaining of ${RECOVERY_COOLDOWN_SEC}s window)."
+            else
+                log "Entering Recovery..."
+
+                for container in $ALL_CONSUMERS; do
+                    if [ "$(container_running "$container")" == "true" ]; then
+                        log "Stopping Consumer: $container..."
+                        docker stop "$container" > /dev/null 2>&1
+                    fi
+                done
+
+                log "FIX: Restarting $DUMB_CONTAINER to recover Decypharr..."
+                docker restart "$DUMB_CONTAINER" > /dev/null 2>&1
+                FOUNDATION_LAST_RESTART_TS=$(date +%s)
+                DEC_START_TS=$FOUNDATION_LAST_RESTART_TS
+
+                D_POST_COUNT=0
+                while [ $D_POST_COUNT -lt 5 ]; do
+                    sleep $((12 * PATIENCE_MULT))
+                    if { timeout $((5 * PATIENCE_MULT))s ls -d "$DEC_MOUNT/__all__" > /dev/null 2>&1 && \
+                         timeout $((5 * PATIENCE_MULT))s ls "$DEC_MOUNT/version.txt" > /dev/null 2>&1; }; then
+                        DEC_MOUNT_ALIVE=true
+                        log "RECOVERY: Decypharr is UP after restart."
+                        break
+                    fi
+                    log "WAITING: Decypharr stabilizing after restart (Attempt $((D_POST_COUNT + 1))/5)..."
+                    ((D_POST_COUNT++))
+                done
+
+                if [[ "$DEC_MOUNT_ALIVE" == "false" ]]; then
+                    log "[!] CRITICAL: Decypharr recovery failed."
+                    notify "Mount Down" "Decypharr recovery failed at $DEC_MOUNT." "alert"
                 fi
-            done
-
-            log "FIX: Restarting $DUMB_CONTAINER to recover Decypharr..."
-            docker restart "$DUMB_CONTAINER" > /dev/null 2>&1
-            DEC_START_TS=$(date +%s)
-
-            D_POST_COUNT=0
-            while [ $D_POST_COUNT -lt 5 ]; do
-                sleep $((12 * PATIENCE_MULT))
-                if { timeout $((5 * PATIENCE_MULT))s ls -d "$DEC_MOUNT/__all__" > /dev/null 2>&1 && \
-                     timeout $((5 * PATIENCE_MULT))s ls "$DEC_MOUNT/version.txt" > /dev/null 2>&1; }; then
-                    DEC_MOUNT_ALIVE=true
-                    log "RECOVERY: Decypharr is UP after restart."
-                    break
-                fi
-                log "WAITING: Decypharr stabilizing after restart (Attempt $((D_POST_COUNT + 1))/5)..."
-                ((D_POST_COUNT++))
-            done
-
-            if [[ "$DEC_MOUNT_ALIVE" == "false" ]]; then
-                log "[!] CRITICAL: Decypharr recovery failed."
-                notify "Mount Down" "Decypharr recovery failed at $DEC_MOUNT." "alert"
             fi
         fi
 
@@ -199,44 +209,64 @@ if [[ "$HARD_RESET" == "N" ]] && [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
         fi
     done
 
-    log "FIX: Restarting $DUMB_CONTAINER..."
-    docker restart "$DUMB_CONTAINER" > /dev/null 2>&1
+    NOW_TS=$(date +%s)
+    COOLDOWN_REMAINING=$(( RECOVERY_COOLDOWN_SEC - (NOW_TS - FOUNDATION_LAST_RESTART_TS) ))
 
-    COUNT=0
-    while [ $COUNT -lt 5 ]; do
-        sleep $((12 * PATIENCE_MULT))
-        if timeout $((5 * PATIENCE_MULT))s ls "$NZB_VALIDATION_SUBFOLDER" > /dev/null 2>&1; then
-            log "SUCCESS: NzbDAV mount stabilized."
-            notify "Mount Success" "NzbDAV mount has been successfully restored." "normal"
-            NZB_STATE="UP"
-            NZB_START_TS=$(date +%s)
-            {
-                echo "N_FAIL_COUNT=0"
-                echo "NZB_STATE=\"$NZB_STATE\""
-                echo "NZB_START_TS=\"$NZB_START_TS\""
-                echo "DEC_STATE=\"${DEC_STATE:-}\""
-                echo "DEC_START_TS=\"${DEC_START_TS:-}\""
-                echo "TOTAL_LMP_PRIMED=${TOTAL_LMP_PRIMED:-0}"
-            } > "$STATE_FILE"
-            NZB_MOUNT_ALIVE=true
-            RECOVERY_FAILED=false
-            break
-        fi
-        log "WAITING: Mount stabilizing (Attempt $((COUNT + 1))/5)..."
-        ((COUNT++))
-    done
-
-    if [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
+    if [[ "$FOUNDATION_LAST_RESTART_TS" -gt 0 ]] && [[ "$COOLDOWN_REMAINING" -gt 0 ]]; then
+        log "[!] COOLDOWN: Skipping NzbDAV recovery restart (${COOLDOWN_REMAINING}s remaining of ${RECOVERY_COOLDOWN_SEC}s window, fail count $N_CUR_FAIL/$MAX_FAILURES)."
         RECOVERY_FAILED=true
-        N_CUR_FAIL=$((N_CUR_FAIL + 1))
         {
             echo "N_FAIL_COUNT=$N_CUR_FAIL"
             echo "NZB_STATE=\"${NZB_STATE:-}\""
             echo "NZB_START_TS=\"${NZB_START_TS:-}\""
             echo "DEC_STATE=\"${DEC_STATE:-}\""
             echo "DEC_START_TS=\"${DEC_START_TS:-}\""
+            echo "FOUNDATION_LAST_RESTART_TS=$FOUNDATION_LAST_RESTART_TS"
             echo "TOTAL_LMP_PRIMED=${TOTAL_LMP_PRIMED:-0}"
         } > "$STATE_FILE"
+    else
+        log "FIX: Restarting $DUMB_CONTAINER..."
+        docker restart "$DUMB_CONTAINER" > /dev/null 2>&1
+        FOUNDATION_LAST_RESTART_TS=$(date +%s)
+
+        COUNT=0
+        while [ $COUNT -lt 5 ]; do
+            sleep $((12 * PATIENCE_MULT))
+            if timeout $((5 * PATIENCE_MULT))s ls "$NZB_VALIDATION_SUBFOLDER" > /dev/null 2>&1; then
+                log "SUCCESS: NzbDAV mount stabilized."
+                notify "Mount Success" "NzbDAV mount has been successfully restored." "normal"
+                NZB_STATE="UP"
+                NZB_START_TS=$(date +%s)
+                {
+                    echo "N_FAIL_COUNT=0"
+                    echo "NZB_STATE=\"$NZB_STATE\""
+                    echo "NZB_START_TS=\"$NZB_START_TS\""
+                    echo "DEC_STATE=\"${DEC_STATE:-}\""
+                    echo "DEC_START_TS=\"${DEC_START_TS:-}\""
+                    echo "FOUNDATION_LAST_RESTART_TS=$FOUNDATION_LAST_RESTART_TS"
+                    echo "TOTAL_LMP_PRIMED=${TOTAL_LMP_PRIMED:-0}"
+                } > "$STATE_FILE"
+                NZB_MOUNT_ALIVE=true
+                RECOVERY_FAILED=false
+                break
+            fi
+            log "WAITING: Mount stabilizing (Attempt $((COUNT + 1))/5)..."
+            ((COUNT++))
+        done
+
+        if [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
+            RECOVERY_FAILED=true
+            N_CUR_FAIL=$((N_CUR_FAIL + 1))
+            {
+                echo "N_FAIL_COUNT=$N_CUR_FAIL"
+                echo "NZB_STATE=\"${NZB_STATE:-}\""
+                echo "NZB_START_TS=\"${NZB_START_TS:-}\""
+                echo "DEC_STATE=\"${DEC_STATE:-}\""
+                echo "DEC_START_TS=\"${DEC_START_TS:-}\""
+                echo "FOUNDATION_LAST_RESTART_TS=$FOUNDATION_LAST_RESTART_TS"
+                echo "TOTAL_LMP_PRIMED=${TOTAL_LMP_PRIMED:-0}"
+            } > "$STATE_FILE"
+        fi
     fi
 fi
 
@@ -279,12 +309,14 @@ if [[ "$TRIGGER_HARD_RESET" == "true" ]]; then
 
     NZB_STATE="DOWN"; NZB_START_TS=$(date +%s)
     DEC_STATE="DOWN"; DEC_START_TS=$(date +%s)
+    FOUNDATION_LAST_RESTART_TS=$(date +%s)
     {
         echo "N_FAIL_COUNT=0"
         echo "NZB_STATE=\"$NZB_STATE\""
         echo "NZB_START_TS=\"$NZB_START_TS\""
         echo "DEC_STATE=\"$DEC_STATE\""
         echo "DEC_START_TS=\"$DEC_START_TS\""
+        echo "FOUNDATION_LAST_RESTART_TS=$FOUNDATION_LAST_RESTART_TS"
         echo "TOTAL_LMP_PRIMED=0"
     } > "$STATE_FILE"
     log "SUCCESS: Nuclear Cleanup complete. Counter reset. EXITING."
@@ -344,6 +376,7 @@ log "$LMP_RUN_COUNT new files found ... $CUR_TOTAL_LMP total files in the librar
     echo "NZB_START_TS=\"${NZB_START_TS:-}\""
     echo "DEC_STATE=\"${DEC_STATE:-}\""
     echo "DEC_START_TS=\"${DEC_START_TS:-}\""
+    echo "FOUNDATION_LAST_RESTART_TS=${FOUNDATION_LAST_RESTART_TS:-0}"
     echo "TOTAL_LMP_PRIMED=$CUR_TOTAL_LMP"
 } > "$STATE_FILE"
 

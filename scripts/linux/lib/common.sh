@@ -25,6 +25,7 @@ fi
 : "${RCLONE_CACHE_DIR:=/var/cache/rclone/cache}"
 : "${STATE_DIR:=/var/lib/dumb-scripts}"
 : "${LOG_DIR:=/var/log/dumb-scripts}"
+: "${RECOVERY_COOLDOWN_SEC:=900}"
 
 : "${CONTAINER_REMOTE_PREFIX:=/mnt/debrid}"
 
