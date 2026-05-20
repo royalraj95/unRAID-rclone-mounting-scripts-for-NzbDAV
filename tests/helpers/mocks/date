@@ -1,0 +1,24 @@
+#!/bin/bash
+# Mock for `date`. When $MOCK_NOW (epoch seconds) is set, every form of
+# `date` resolves to that virtual time. When unset, passes through to
+# the real date binary.
+if [ -z "$MOCK_NOW" ]; then
+    exec /bin/date "$@"
+fi
+
+case "$1" in
+    +%s)
+        echo "$MOCK_NOW"
+        ;;
+    +*)
+        # Reformat $MOCK_NOW using the requested format.
+        /bin/date -d "@$MOCK_NOW" "$1"
+        ;;
+    "'+%Y-%m-%d %H:%M:%S'")
+        # Already-quoted form, in case shell expansion preserved it.
+        /bin/date -d "@$MOCK_NOW" "+%Y-%m-%d %H:%M:%S"
+        ;;
+    *)
+        exec /bin/date "$@"
+        ;;
+esac
