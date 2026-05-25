@@ -28,8 +28,8 @@ CONSUMERS = empty by default
 DUMB exposes mounts to the host via a **shared propagation bind**:
 container `/mnt/debrid` ↔ host `<REMOTE_BIND>`.
 
-`*Arr` containers bind the same host path as `/mnt/debrid`, so symlinks written by `*Arrs`
-use the **container-side path** (`/mnt/debrid/decypharr/realdebrid/__all__/...`). That's
+`*Arr` containers bind the same host path as `/mnt/debrid`, so `*Arrs` write symlinks using
+the **container-side path** (`/mnt/debrid/decypharr/realdebrid/__all__/...`). That's
 why the Sentinel matches symlink targets against `$CONTAINER_REMOTE_PREFIX`, not the
 host path.
 
@@ -48,8 +48,7 @@ container restart).
 Runs every 2 minutes — faster than the Heartbeat. Plex caches stale FUSE handles after a
 mount drops and **cannot recover on its own**; the only fix is restarting the container
 once the mount is back. Either RD (Decypharr) or NzbDAV going down stops Plex; both back
-up restarts it. Kept separate from the Heartbeat so the concerns don't blur and the
-faster cadence isn't slowed by priming work.
+up restarts it. Separate from the Heartbeat — Plex recovery and mount priming run at different cadences and should not share code.
 
 ### 3. Symlink Sentinel
 Audits `-remote` media folders for broken symlinks pointing at the debrid mounts. Uses a
@@ -93,16 +92,13 @@ curl -s "$PLEX_URL/library/sections?X-Plex-Token=$PLEX_TOKEN" | \
 
 Plex needs **container-restart-on-recovery** to drop stale FUSE handles. The Heartbeat
 restarts `DUMB-2026` and brings *Arrs back, but Plex requires its own monitoring loop on
-a faster cadence (2 min vs 5 min). Keeping the concerns separate means:
-
-- Heartbeat focuses on foundation health + priming.
-- Plex Monitor focuses on user-visible playback recovery.
-- Both run independently; if Heartbeat is mid-recovery, the Plex Monitor naturally sees
-  mounts down → stops Plex → sees mounts up → starts Plex. No cross-script locking.
+a faster cadence (2 min vs 5 min). - Heartbeat: foundation health and priming.
+- Plex Monitor: user-visible playback recovery.
+- Both run independently. If Heartbeat is mid-recovery, the Plex Monitor sees mounts down, stops Plex, then starts it when mounts return.
 
 ---
 
-## What these scripts deliberately do NOT do
+## Out of scope
 
 - Manage a host-side `rclone` binary. rclone lives inside DUMB-2026; recovery is
   container-level.

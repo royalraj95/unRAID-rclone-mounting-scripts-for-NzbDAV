@@ -29,6 +29,11 @@ LOG_FILE="$LOG_DIR/plex_monitor.log"
 
 log() { log_step "$1" "$LOG_FILE"; }
 
+if backup_in_progress; then
+    log "[PAUSED] appdata backup in progress — skipping run"
+    exit 0
+fi
+
 RD_UP=false
 NZB_UP=false
 is_mounted "$RD_MOUNT_PATH" && RD_UP=true

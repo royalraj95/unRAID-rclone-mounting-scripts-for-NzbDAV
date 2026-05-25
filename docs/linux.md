@@ -128,8 +128,7 @@ confirms correct behavior — then `systemctl restart nzbdav-symlink-cleanup.tim
 
 > **Behavior note:** the Linux Sentinel sends a `notify` alert when the circuit breaker
 > trips (`TOTAL_BROKEN_GLOBAL > MAX_BROKEN_BEFORE_HALT`). The Unraid version logs this
-> but does not notify. This is an intentional improvement — it makes the "Sentinel
-> Locked" state visible via your configured notification backend.
+> but does not notify. Linux alerts you when the circuit breaker trips. Unraid only logs it.
 
 ### 4. Janitor (shutdown)
 
@@ -142,8 +141,7 @@ sudo systemctl stop nzbdav-shutdown-janitor.service
 tail /var/log/dumb-scripts/shutdown.log
 ```
 
-Stopping the service triggers `ExecStop=`, which runs the janitor. (Restart the service
-afterwards: `sudo systemctl start nzbdav-shutdown-janitor.service`.)
+Stopping the service triggers `ExecStop=`, which runs the janitor. (Restart it after: `sudo systemctl start nzbdav-shutdown-janitor.service`.)
 
 ---
 

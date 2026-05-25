@@ -76,6 +76,9 @@ STATE_DB="/mnt/user/appdata/other/scripts/dumb-2026/sentinel_state.db"
 AUDIT_LOG="/mnt/user/appdata/other/scripts/dumb-2026/sentinel_audit.log"
 HOLD_FILE="/mnt/user/appdata/other/scripts/dumb-2026/SENTINEL_HOLD.txt"
 PRIME_STATE="/mnt/user/appdata/other/scripts/dumb-2026/prime_state.db"
+BACKUP_PAUSE_FILE="${BACKUP_PAUSE_FILE:-/tmp/dumb-scripts.pause}"
+BACKUP_PROC_PATTERN="${BACKUP_PROC_PATTERN:-(appdata\.backup|ca\.backup2).*backup\.(php|sh)}"
+BACKUP_PAUSE_MAX_AGE_MIN="${BACKUP_PAUSE_MAX_AGE_MIN:-120}"
 
 # Symlink target prefix (container-side) — must match what DUMB's *Arrs write into symlinks.
 # Verified via readlink: targets are /mnt/debrid/decypharr/realdebrid/__all__/...
@@ -98,6 +101,22 @@ MIN_PACKS_SANITY=100
 # --------------------------------------------------------------------------------------
 
 log_it() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
+
+_backup_in_progress() {
+    if [ -f "$BACKUP_PAUSE_FILE" ]; then
+        if find "$BACKUP_PAUSE_FILE" -mmin +"$BACKUP_PAUSE_MAX_AGE_MIN" 2>/dev/null | grep -q .; then
+            rm -f "$BACKUP_PAUSE_FILE" 2>/dev/null || true  # stale — auto-clear
+        else
+            return 0  # fresh sentinel; backup is active
+        fi
+    fi
+    pgrep -fq "$BACKUP_PROC_PATTERN" 2>/dev/null
+}
+if _backup_in_progress; then
+    log_it "[PAUSED] appdata backup in progress — skipping run"
+    exit 0
+fi
+
 touch "$STATE_DB"
 [ ! -f "$AUDIT_LOG" ] && touch "$AUDIT_LOG"
 

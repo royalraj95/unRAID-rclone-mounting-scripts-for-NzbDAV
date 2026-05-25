@@ -32,6 +32,11 @@ LOG_FILE="$LOG_DIR/heartbeat.log"
 
 log() { log_step "$1" "$LOG_FILE"; }
 
+if backup_in_progress; then
+    log "[PAUSED] appdata backup in progress — skipping run"
+    exit 0
+fi
+
 ALL_CONSUMERS="$CONSUMERS"
 
 # --- SECTION 1: SUMMARY ----------------------------------------------------------------
