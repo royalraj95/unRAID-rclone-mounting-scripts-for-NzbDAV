@@ -29,6 +29,12 @@ fi
 
 : "${CONTAINER_REMOTE_PREFIX:=/mnt/debrid}"
 
+: "${BACKUP_PAUSE_FILE:=/run/dumb-scripts.pause}"
+# Matches both modern appdata.backup and legacy ca.backup2 Commander-Apps variants.
+# Verify during a live backup: pgrep -af backup
+: "${BACKUP_PROC_PATTERN:=(appdata\.backup|ca\.backup2).*backup\.(php|sh)}"
+: "${BACKUP_PAUSE_MAX_AGE_MIN:=120}"
+
 mkdir -p "$STATE_DIR" "$LOG_DIR" 2>/dev/null || true
 
 # --- Logging ---------------------------------------------------------------------------
@@ -56,6 +62,21 @@ is_mounted() {
 # "true" / "false" / "" — same as docker inspect's State.Running.
 container_running() {
     docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null
+}
+
+# True while an appdata backup is running (sentinel file OR live backup process).
+# Stale-lock safety: auto-expires the sentinel after BACKUP_PAUSE_MAX_AGE_MIN (default 2h)
+# so a crashed post-run hook cannot pause the scripts forever.
+backup_in_progress() {
+    if [ -f "$BACKUP_PAUSE_FILE" ]; then
+        if find "$BACKUP_PAUSE_FILE" -mmin +"${BACKUP_PAUSE_MAX_AGE_MIN}" 2>/dev/null | grep -q .; then
+            # Sentinel is stale — auto-clear and fall through to pgrep check.
+            rm -f "$BACKUP_PAUSE_FILE" 2>/dev/null || true
+        else
+            return 0  # fresh sentinel; backup is active
+        fi
+    fi
+    pgrep -fq "$BACKUP_PROC_PATTERN" 2>/dev/null
 }
 
 # Human-readable duration from a UNIX timestamp argument.

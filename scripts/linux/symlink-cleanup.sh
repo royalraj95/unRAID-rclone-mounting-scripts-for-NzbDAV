@@ -69,6 +69,11 @@ DEC_LINK_PREFIX="$CONTAINER_REMOTE_PREFIX/decypharr"
 
 log_it() { log_step "$1" "$AUDIT_LOG"; }
 
+if backup_in_progress; then
+    log_it "[PAUSED] appdata backup in progress — skipping run"
+    exit 0
+fi
+
 touch "$STATE_DB" "$AUDIT_LOG"
 
 echo "------------------------------------------------------------"

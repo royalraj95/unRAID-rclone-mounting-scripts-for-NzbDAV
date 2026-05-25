@@ -1,9 +1,9 @@
 # Notifications — Linux backends
 
 The Linux scripts call `notify "subject" "message" [priority]` from
-[`scripts/linux/lib/notify.sh`](../scripts/linux/lib/notify.sh). Which backend handles
-the call is chosen via `NOTIFY_BACKEND` in `/etc/dumb-scripts/config.env`. Any backend
-failure falls back to syslog so notifications are never silently dropped.
+[`scripts/linux/lib/notify.sh`](../scripts/linux/lib/notify.sh). Set `NOTIFY_BACKEND` in
+`/etc/dumb-scripts/config.env` to choose the backend. Any backend failure falls back to
+syslog. No notification is lost.
 
 On Unraid, notifications go through the WebUI's built-in `notify` script — this doc
 doesn't apply there.
@@ -75,7 +75,7 @@ apprise -t "dumb-scripts test" -b "hello" -- "$APPRISE_URLS"
 
 ## `discord` — Discord webhook
 
-If you only need Discord, this skips the Apprise dependency.
+If you only need Discord, skip Apprise.
 
 ```
 NOTIFY_BACKEND=discord

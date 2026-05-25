@@ -116,6 +116,60 @@ Only add `-remote` folders (DUMB-managed symlinks). Never add local-only folders
 
 ---
 
+## Appdata backup coordination
+
+The DUMB scripts detect a running appdata backup and skip that run (logging `[PAUSED] appdata backup in progress`). This prevents the scripts from restarting `DUMB-2026` or `binhex-plex` mid-backup, which corrupts the tar archive.
+
+Two detection layers:
+1. **Sentinel file** `/tmp/dumb-scripts.pause` — set by a pre-run hook, cleared by a post-run hook.
+2. **Process fallback** — `pgrep` for the backup process (covers the case where hooks aren't yet configured).
+
+### Setting up the hooks
+
+In the **Commander-Apps appdata.backup** plugin (Settings → Appdata Backup → Advanced →
+Custom pre/post scripts), add:
+
+**Pre-run script** (runs before containers are stopped):
+```bash
+#!/bin/bash
+touch /tmp/dumb-scripts.pause
+sleep 10   # allow any in-flight script run to finish before the backup stops containers
+```
+
+**Post-run script** (runs after containers are restarted):
+```bash
+#!/bin/bash
+rm -f /tmp/dumb-scripts.pause
+```
+
+> **Why the `sleep 10` in pre-run?** The guard fires at the top of each script run. If a
+> Heartbeat run passed the guard a few seconds before the pre-run hook executes, it will
+> continue — including any `docker restart` it issues. The 10-second sleep covers the gap:
+> the next cron tick (5 min later) will see the sentinel and skip cleanly.
+
+### Stale-lock safety
+
+The sentinel auto-expires after 2 hours (`BACKUP_PAUSE_MAX_AGE_MIN=120`). If the backup
+crashes and the post-run hook never fires, all scripts resume automatically after two hours.
+
+To change the timeout, set `BACKUP_PAUSE_MAX_AGE_MIN` in the User Scripts plugin's
+environment, or edit the var directly in each `(DUMB)` script.
+
+### Verifying the pgrep fallback pattern
+
+The default pattern matches both the modern `appdata.backup` and legacy `ca.backup2`
+Commander-Apps plugins. Confirm it matches your installation:
+
+```bash
+# Run this while a backup is active
+pgrep -af backup
+```
+
+If the output doesn't contain `appdata.backup` or `ca.backup2`, set
+`BACKUP_PROC_PATTERN` to a pattern that does (edit the var in each script).
+
+---
+
 ## Hard reset
 
 Set `HARD_RESET="Y"` in `scripts/unraid/Mount Script (DUMB)` and run once via User
@@ -135,7 +189,6 @@ Reset `HARD_RESET` back to `"N"` immediately after.
 
 The `Mount Script`, `Symlink Cleanup`, and `Array Stop Script` files (without `(DUMB)`)
 in `scripts/unraid/` target a different architecture: host rclone binary, separate
-NzbDAV and Decypharr containers, ZFS pools. They're retained for reference. Do not run
-them on a DUMB-stack server.
+NzbDAV and Decypharr containers, ZFS pools. Do not run them on a DUMB-stack server.
 
 For community discussion: [Unraid Support Thread](https://forums.unraid.net/topic/198498-rclone-scripts-to-mount-nzbdav-to-create-a-large-plex-library-with-fast-launch-times-and-efficient-arr-usage/).

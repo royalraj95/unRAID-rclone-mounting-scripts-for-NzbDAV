@@ -25,6 +25,9 @@ RD_MOUNT_PATH="/mnt/user/data/remote/decypharr/realdebrid/__all__"
 NZB_MOUNT_PATH="/mnt/user/data/remote/nzbdav"
 STATE_FILE="/mnt/user/appdata/other/scripts/dumb-2026/plex_mount_state"
 LOG_FILE="/mnt/user/appdata/other/scripts/dumb-2026/plex_monitor.log"
+BACKUP_PAUSE_FILE="${BACKUP_PAUSE_FILE:-/tmp/dumb-scripts.pause}"
+BACKUP_PROC_PATTERN="${BACKUP_PROC_PATTERN:-(appdata\.backup|ca\.backup2).*backup\.(php|sh)}"
+BACKUP_PAUSE_MAX_AGE_MIN="${BACKUP_PAUSE_MAX_AGE_MIN:-120}"
 
 # --------------------------------------------------------------------------------------
 # 2. MAIN SCRIPT
@@ -36,6 +39,21 @@ mkdir -p "$(dirname "$STATE_FILE")"
 log() {
     echo "[$(date "+%Y-%m-%d %H:%M:%S")] $1" | tee -a "$LOG_FILE"
 }
+
+_backup_in_progress() {
+    if [ -f "$BACKUP_PAUSE_FILE" ]; then
+        if find "$BACKUP_PAUSE_FILE" -mmin +"$BACKUP_PAUSE_MAX_AGE_MIN" 2>/dev/null | grep -q .; then
+            rm -f "$BACKUP_PAUSE_FILE" 2>/dev/null || true  # stale — auto-clear
+        else
+            return 0  # fresh sentinel; backup is active
+        fi
+    fi
+    pgrep -fq "$BACKUP_PROC_PATTERN" 2>/dev/null
+}
+if _backup_in_progress; then
+    log "[PAUSED] appdata backup in progress — skipping run"
+    exit 0
+fi
 
 notify() {
     /usr/local/emhttp/webGui/scripts/notify -e "DUMB Mount Monitor" -s "$1" -d "$2" -i "${3:-normal}" 2>/dev/null
