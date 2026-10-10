@@ -6,7 +6,8 @@ keeping the symlink-backed library healthy.
 
 Designed to be deployable on either **Unraid** (via the User Scripts plugin) or any
 modern **Linux/Docker host** (Ubuntu, Debian, Fedora, etc.) via systemd timers. The
-scripts themselves are identical in behavior; only the platform plumbing differs.
+Unraid scripts are at v2.0 (NzbDAV-only). The Linux port is still v1 (NzbDAV +
+Decypharr) and hasn't been updated yet.
 
 ---
 
@@ -15,7 +16,7 @@ scripts themselves are identical in behavior; only the platform plumbing differs
 | Platform | Scripts | Scheduler | Setup guide |
 |---|---|---|---|
 | **Unraid** | [`scripts/unraid/`](scripts/unraid/) | User Scripts plugin | **[docs/unraid.md](docs/unraid.md)** |
-| **Linux / Ubuntu / Docker** | [`scripts/linux/`](scripts/linux/) | systemd timers (+ cron fallback) | **[docs/linux.md](docs/linux.md)** |
+| **Linux / Ubuntu / Docker** (v1) | [`scripts/linux/`](scripts/linux/) | systemd timers (+ cron fallback) | **[docs/linux.md](docs/linux.md)** |
 
 For the foundation/consumer model, mount semantics, and the rationale behind each script,
 read **[docs/architecture.md](docs/architecture.md)** first.
@@ -24,21 +25,28 @@ read **[docs/architecture.md](docs/architecture.md)** first.
 
 ## What's in the toolkit
 
-Four scripts that together keep the DUMB stack healthy:
+Four scripts that together keep the DUMB stack healthy. The Unraid scripts (v2.0) are
+NzbDAV/InfiniDysk-only; Decypharr/Real-Debrid is no longer used.
 
-1. **Mount Heartbeat** — every 5 min. Validates NzbDAV and Decypharr mounts; stops
-   consumers and restarts `DUMB-2026` to recover; primes the rclone dir-cache
-   incrementally; escalates to a hard reset (wipe VFS cache + container recycle) on
-   repeated failure.
-2. **Plex Mount Monitor** — every 2 min. Stops Plex when either mount goes down,
-   restarts Plex once both recover. Plex caches stale FUSE handles and can't recover on
-   its own.
-3. **Symlink Sentinel** — daily. Audits `-remote` libraries for broken symlinks pointing
-   at the debrid mounts. Triggers the matching `*Arr` rescan + a Plex section refresh.
-   Dry-run default, circuit breaker, rolling 24-hour deletion cap.
+1. **Mount Heartbeat** — every 5 min. Checks the NzbDAV rclone mount and InfiniDysk's
+   WebDAV backend. Recovers with the least disruptive action that works: restart just
+   rclone through the DUMB API, then InfiniDysk, then the whole container, then a hard
+   reset.
+2. **Plex Mount Monitor** — every 2 min. Stops Plex after two consecutive failed mount
+   checks and brings it back once the mount recovers. Plex caches stale FUSE handles and
+   can't recover on its own.
+3. **Symlink Sentinel** — daily. Finds library symlinks whose InfiniDysk item no longer
+   exists by comparing link targets against InfiniDysk's own database (read-only, zero
+   FUSE traffic). Deletes them, asks the owning `*Arr` to rescan and re-search that one
+   title, and asks Plex to scan that folder. Dry-run default, circuit breaker, rolling
+   24-hour deletion cap.
 4. **Shutdown Janitor** — at OS / array shutdown. Stops `DUMB-2026` with a long grace
-   timeout (so the internal postgres flushes), releases the shared debrid bind, then
-   stops the remaining containers.
+   timeout (so the internal postgres flushes), stops the remaining containers, then
+   releases stale FUSE mounts under the shared bind.
+
+All host-specific settings and secrets live in one `dumb.conf`
+([example](scripts/unraid/dumb.conf.example)), so the scripts paste into User Scripts
+unchanged.
 
 See [docs/architecture.md](docs/architecture.md) for how they fit together.
 
@@ -48,8 +56,8 @@ See [docs/architecture.md](docs/architecture.md) for how they fit together.
 
 ```
 scripts/
-├── unraid/   — Unraid (User Scripts plugin); originals + (DUMB) variants
-└── linux/    — Linux/systemd port of the (DUMB) variants, plus systemd units + installer
+├── unraid/   — Unraid (User Scripts plugin); originals + (DUMB) variants + dumb.conf.example
+└── linux/    — Linux/systemd port of the v1 (DUMB) variants, plus systemd units + installer
 docs/
 ├── architecture.md     — foundation/consumer model, paths, design choices
 ├── unraid.md           — Unraid setup guide
