@@ -1,61 +1,75 @@
 #!/bin/bash
 # ======================================================================================
-# SCRIPT: Rclone Heartbeat & Intelligent Priming (DUMB Edition)
-# VERSION: v1.0-DUMB-RC1
-# DESCRIPTION: Monitors NzbDAV and Decypharr mounts exposed by DUMB-2026 via the
-#              shared propagation bind (/mnt/debrid inside container →
-#              /mnt/user/data/remote on host). Recovery restarts DUMB-2026.
-#              No host-side rclone management — rclone lives inside the container.
+# SCRIPT: Rclone Heartbeat (DUMB Edition)
+# VERSION: v2.0-DUMB
+# DESCRIPTION: Monitors the NzbDAV/InfiniDysk rclone mount that DUMB-2026 exposes on the
+#              host via the shared bind (/mnt/debrid in the container →
+#              /mnt/user/data/remote on the host) and recovers it with the least
+#              disruptive action that works:
+#
+#                fail #1  restart "rclone w/ InfiniDysk" via the DUMB API
+#                fail #2  restart "InfiniDysk", then rclone, via the DUMB API
+#                fail #3+ docker restart DUMB-2026  (cooldown-gated)
+#                MAX      hard reset: docker stop + start DUMB-2026
+#
+#              Without DUMB API credentials the first two rungs are skipped.
+#              HARD_RESET=Y additionally wipes the rclone VFS cache (manual use only).
+#
+# v2.0: NzbDAV-only (Decypharr/Real-Debrid is disabled in DUMB). Removed the symlink
+#       "priming" pass — `ls -d` on a symlink never touched the mount, so it did nothing.
 # ======================================================================================
 
 # --------------------------------------------------------------------------------------
-# 1. USER CONFIGURATION
+# 1. USER CONFIGURATION (override in dumb.conf — see dumb.conf.example)
 # --------------------------------------------------------------------------------------
 
-# --- SCRIPT SETTINGS ---
-SCRIPT_VERSION="v1.0-DUMB-RC1"
-HARD_RESET="N"                      # Y = stop DUMB-2026, wipe rclone cache, exit. Restart manually after.
-MAX_FAILURES="5"                    # Hard-reset auto-trigger after this many consecutive recovery failures
-RECOVERY_COOLDOWN_SEC="900"         # Min seconds between Decypharr recovery / foundation restarts (3 heartbeat cycles)
-PRIME_MAX_TIME="60"                 # Seconds to spend priming the dir-cache per run
-STATE_FILE="/mnt/user/appdata/other/scripts/dumb-2026/prime_state.db"
-LOG_FILE="/mnt/user/appdata/other/scripts/dumb-2026/heartbeat.log"
+DUMB_CONF="${DUMB_CONF:-/mnt/user/appdata/other/scripts/dumb-2026/dumb.conf}"
+# shellcheck source=/dev/null
+[ -f "$DUMB_CONF" ] && source "$DUMB_CONF"
 
-# --- MOUNT VALIDATION ---
-# HOST-SIDE paths. NzbDAV is at the nzbdav/ dir directly; Decypharr's fuse.decypharr
-# fs is mounted one level deeper at decypharr/realdebrid/ — NOT at decypharr/ itself.
-NZB_MOUNT="/mnt/user/data/remote/nzbdav"
-DEC_MOUNT="/mnt/user/data/remote/decypharr/realdebrid"
-LOCAL_MEDIA_PATH="/mnt/user/data/media"
+SCRIPT_VERSION="v2.0-DUMB"
+HARD_RESET="${HARD_RESET:-N}"                   # Y = stop DUMB-2026, wipe rclone cache, start. Manual use only.
+MAX_FAILURES="${MAX_FAILURES:-5}"               # consecutive failed recoveries before the hard reset
+RECOVERY_COOLDOWN_SEC="${RECOVERY_COOLDOWN_SEC:-900}"  # min seconds between container-level restarts
+RECOVERY_WAIT_SEC="${RECOVERY_WAIT_SEC:-120}"   # how long to wait for the mount after a recovery action
+PROBE_TIMEOUT="${PROBE_TIMEOUT:-10}"
+PROBE_ATTEMPTS="${PROBE_ATTEMPTS:-3}"           # initial probe retries before declaring the mount down
+STATE_FILE="${STATE_FILE:-/mnt/user/appdata/other/scripts/dumb-2026/prime_state.db}"
+LOG_FILE="${LOG_FILE:-/mnt/user/appdata/other/scripts/dumb-2026/heartbeat.log}"
 
-# rclone VFS cache is a host-side bind (/cache inside DUMB → this path on host).
-# Used only when HARD_RESET=Y to wipe stale cache without docker exec.
-RCLONE_CACHE_DIR="/mnt/cache_ssd/rclone-cache/cache"
+# --- MOUNT ---
+NZB_MOUNT="${NZB_MOUNT:-/mnt/user/data/remote/nzbdav}"
+NZB_PROBE_DIR="${NZB_PROBE_DIR:-completed-symlinks}"  # subdir that must list for the mount to count as up
+NZB_WEBDAV_URL="${NZB_WEBDAV_URL-http://127.0.0.1:8089/}"  # InfiniDysk backend; empty = skip
+RCLONE_CACHE_DIR="${RCLONE_CACHE_DIR:-/mnt/cache_ssd/rclone-cache/cache}"
 
-# --- DOCKER SETTINGS ---
-DUMB_CONTAINER="DUMB-2026"
-ENABLERS="binhex-prowlarr"          # external indexer that feeds DUMB's internal *Arrs
-CONSUMERS=""                         # empty: binhex *Arrs manage local libraries and don't consume DUMB's mounts;
-                                     # DUMB's internal *Arrs go down/up with the container automatically
+# --- DOCKER ---
+DUMB_CONTAINER="${DUMB_CONTAINER:-DUMB-2026}"
+ENABLERS="${ENABLERS-binhex-prowlarr}"          # external containers DUMB depends on; started if down
+FOUNDATION_WAIT_SEC="${FOUNDATION_WAIT_SEC:-30}"
 
-# --- EXCLUSION SETTINGS (subfolders under LOCAL_MEDIA_PATH to skip during priming) ---
-# Skip local-only libraries (managed by the independent binhex stack, not DUMB).
-EXCLUDE_DIRS="/books /downloads /tv /movies-hd /movies-uhd /movies-indian /Favorite-Scenes /music-videos"
-EXCLUDE_EXTS=".srt .ass .vtt"
+# --- DUMB API (optional; enables per-process restarts) ---
+DUMB_API_URL="${DUMB_API_URL:-http://127.0.0.1:3005/api}"
+DUMB_API_USERNAME="${DUMB_API_USERNAME:-}"
+DUMB_API_PASSWORD="${DUMB_API_PASSWORD:-}"
+DUMB_RCLONE_PROCESS="${DUMB_RCLONE_PROCESS:-rclone w/ InfiniDysk}"
+DUMB_NZB_PROCESS="${DUMB_NZB_PROCESS:-InfiniDysk}"
 
 # --- BACKUP COORDINATION ---
 # Set by appdata.backup pre-run hook; cleared by post-run hook.
 BACKUP_PAUSE_FILE="${BACKUP_PAUSE_FILE:-/tmp/dumb-scripts.pause}"
-# pgrep fallback: matches both modern appdata.backup and legacy ca.backup2.
-# VERIFY during a live backup: pgrep -af backup
 BACKUP_PROC_PATTERN="${BACKUP_PROC_PATTERN:-(appdata\.backup|ca\.backup2).*backup\.(php|sh)}"
 BACKUP_PAUSE_MAX_AGE_MIN="${BACKUP_PAUSE_MAX_AGE_MIN:-120}"
 
 # --------------------------------------------------------------------------------------
-# 2. MAIN SCRIPT
+# 2. HELPERS
 # --------------------------------------------------------------------------------------
 
-log_step() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
+log_step() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
+
+send_notification() {
+    /usr/local/emhttp/webGui/scripts/notify -e "Rclone Heartbeat" -s "$1" -d "$2" -i "$3"
+}
 
 _backup_in_progress() {
     if [ -f "$BACKUP_PAUSE_FILE" ]; then
@@ -67,423 +81,262 @@ _backup_in_progress() {
     fi
     pgrep -fq "$BACKUP_PROC_PATTERN" 2>/dev/null
 }
+
+container_running() {
+    [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = "true" ]
+}
+
+# Mount check only — no network. A dead rclone leaves the mountpoint in place but
+# readdir fails or hangs; the timeout turns a hang into a failure.
+mount_up() {
+    timeout "$PROBE_TIMEOUT" mountpoint -q "$NZB_MOUNT" || return 1
+    timeout "$PROBE_TIMEOUT" ls "$NZB_MOUNT/$NZB_PROBE_DIR" > /dev/null 2>&1
+}
+
+# The rclone dir cache can keep answering readdir after InfiniDysk itself has died,
+# so also check that the WebDAV backend replies at all (401 counts as alive).
+backend_up() {
+    [ -z "$NZB_WEBDAV_URL" ] && return 0
+    local code
+    code=$(curl -s -o /dev/null -m "$PROBE_TIMEOUT" -w '%{http_code}' "$NZB_WEBDAV_URL" 2>/dev/null)
+    [ -n "$code" ] && [ "$code" != "000" ]
+}
+
+wait_for_mount() {
+    local waited=0
+    while [ "$waited" -lt "$RECOVERY_WAIT_SEC" ]; do
+        sleep 10
+        waited=$((waited + 10))
+        if mount_up && backend_up; then
+            log_step "RECOVERY: NzbDAV mount is back after ${waited}s."
+            return 0
+        fi
+        log_step "WAITING: mount not back yet (${waited}/${RECOVERY_WAIT_SEC}s)..."
+    done
+    return 1
+}
+
+api_configured() {
+    [ -n "$DUMB_API_URL" ] && [ -n "$DUMB_API_USERNAME" ] && [ -n "$DUMB_API_PASSWORD" ]
+}
+
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+DUMB_TOKEN=""
+api_login() {
+    local body
+    body=$(curl -s -m 15 -X POST "$DUMB_API_URL/auth/login" \
+        -H 'Content-Type: application/json' \
+        -d "{\"username\":\"$(json_escape "$DUMB_API_USERNAME")\",\"password\":\"$(json_escape "$DUMB_API_PASSWORD")\"}" 2>/dev/null)
+    DUMB_TOKEN=$(printf '%s' "$body" | sed -n 's/.*"access_token" *: *"\([^"]*\)".*/\1/p')
+    [ -n "$DUMB_TOKEN" ]
+}
+
+# POST /process/restart-service. Lifecycle calls can take a while server-side.
+api_restart() {
+    local process="$1" code
+    code=$(curl -s -o /dev/null -m 180 -w '%{http_code}' -X POST "$DUMB_API_URL/process/restart-service" \
+        -H "Authorization: Bearer $DUMB_TOKEN" -H 'Content-Type: application/json' \
+        -d "{\"process_name\":\"$(json_escape "$process")\"}" 2>/dev/null)
+    if [ "$code" = "200" ]; then
+        log_step "API: restarted \"$process\"."
+        return 0
+    fi
+    log_step "[!] API: restart of \"$process\" failed (HTTP ${code:-none})."
+    return 1
+}
+
+save_state() {
+    {
+        echo "N_FAIL_COUNT=${N_FAIL_COUNT:-0}"
+        echo "NZB_STATE=\"${NZB_STATE:-UNKNOWN}\""
+        echo "NZB_START_TS=\"${NZB_START_TS:-0}\""
+        echo "FOUNDATION_LAST_RESTART_TS=${FOUNDATION_LAST_RESTART_TS:-0}"
+        echo "LAST_RECOVERY_TS=${LAST_RECOVERY_TS:-0}"
+        echo "LAST_RECOVERY_ACTION=\"${LAST_RECOVERY_ACTION:-none}\""
+    } > "$STATE_FILE"
+}
+
+set_nzb_state() {
+    if [ "$NZB_STATE" != "$1" ]; then
+        NZB_STATE="$1"
+        NZB_START_TS=$(date +%s)
+    fi
+}
+
+container_restart_allowed() {
+    local now remaining
+    now=$(date +%s)
+    remaining=$(( RECOVERY_COOLDOWN_SEC - (now - FOUNDATION_LAST_RESTART_TS) ))
+    if [ "$FOUNDATION_LAST_RESTART_TS" -gt 0 ] && [ "$remaining" -gt 0 ]; then
+        log_step "[!] COOLDOWN: container restarted recently — skipping (${remaining}s left of ${RECOVERY_COOLDOWN_SEC}s, fail count $N_FAIL_COUNT/$MAX_FAILURES)."
+        return 1
+    fi
+    return 0
+}
+
+hard_reset() {
+    local wipe="$1"
+    log_step "HARD RESET: stopping $DUMB_CONTAINER..."
+    send_notification "Forced Reset" "Heartbeat hard reset of $DUMB_CONTAINER (fail count $N_FAIL_COUNT, cache wipe: $wipe)." "alert"
+    docker stop "$DUMB_CONTAINER" > /dev/null 2>&1
+    if [ "$wipe" = "Y" ] && [ -d "$RCLONE_CACHE_DIR" ]; then
+        log_step "Wiping rclone VFS cache at $RCLONE_CACHE_DIR..."
+        rm -rf "${RCLONE_CACHE_DIR:?}"/*
+    fi
+    sleep 5
+    log_step "Starting $DUMB_CONTAINER..."
+    docker start "$DUMB_CONTAINER" > /dev/null 2>&1
+    FOUNDATION_LAST_RESTART_TS=$(date +%s)
+    LAST_RECOVERY_TS=$FOUNDATION_LAST_RESTART_TS
+    LAST_RECOVERY_ACTION="hard-reset"
+    N_FAIL_COUNT=0
+    set_nzb_state "DOWN"
+    save_state
+}
+
+# --------------------------------------------------------------------------------------
+# 3. MAIN
+# --------------------------------------------------------------------------------------
+
+mkdir -p "$(dirname "$STATE_FILE")" "$(dirname "$LOG_FILE")"
+
 if _backup_in_progress; then
     log_step "[PAUSED] appdata backup in progress — skipping run"
     exit 0
 fi
 
-send_notification() {
-    local subject="$1"
-    local message="$2"
-    local importance="$3"
-    /usr/local/emhttp/webGui/scripts/notify -e "Rclone Heartbeat" -s "$subject" -d "$message" -i "$importance"
-}
-
-ALL_CONSUMERS="$CONSUMERS"
-
-# --- SECTION 2.1: SUMMARY ---
-log_step "VALIDATING: Script configuration and environment..."
-echo "---------------------------------------------------"
-echo "[CONFIG SUMMARY]"
-echo "Script Version:      $SCRIPT_VERSION"
-echo "State File:          $STATE_FILE"
-echo "Hard Reset Toggle:   $HARD_RESET"
-echo ""
-echo "[MOUNT PATHS]"
-echo "NzbDAV (host):       $NZB_MOUNT"
-echo "Decypharr (host):    $DEC_MOUNT"
-echo "Media Library:       $LOCAL_MEDIA_PATH"
-echo ""
-echo "[DOCKER SETTINGS]"
-echo "Foundation:          $DUMB_CONTAINER"
-echo "Enabler Containers:  $ENABLERS"
-echo "Consumer Containers: $CONSUMERS"
-echo "---------------------------------------------------"
-
-# --- SECTION 2.2: ENVIRONMENTAL READINESS ---
-if [[ "$HARD_RESET" == "N" ]]; then
-    log_step "VERIFYING: System environment and load..."
-    mkdir -p "$(dirname "$STATE_FILE")"
-    mkdir -p "$(dirname "$LOG_FILE")"
-
-    CURRENT_LOAD=$(awk '{print $1}' /proc/loadavg | cut -d. -f1)
-    PATIENCE_MULT=1
-    if [ "$CURRENT_LOAD" -gt 80 ]; then
-        log_step "PATIENCE: High load detected ($CURRENT_LOAD). Doubling timeouts."
-        PATIENCE_MULT=2
-    fi
-fi
-
-# --- SECTION 2.3: FOUNDATION CHECK ---
+# Older state files carry Decypharr/priming keys; sourcing them is harmless.
+# shellcheck source=/dev/null
 [ -f "$STATE_FILE" ] && source "$STATE_FILE"
+N_FAIL_COUNT=${N_FAIL_COUNT:-0}
 FOUNDATION_LAST_RESTART_TS=${FOUNDATION_LAST_RESTART_TS:-0}
-FOUNDATION_RESTARTED=false
+LAST_RECOVERY_TS=${LAST_RECOVERY_TS:-0}
 
-if [ "$(docker inspect -f '{{.State.Running}}' "$DUMB_CONTAINER" 2>/dev/null)" != "true" ]; then
-    log_step "[!] $DUMB_CONTAINER is down. Starting..."
-    docker start "$DUMB_CONTAINER" > /dev/null 2>&1
-    FOUNDATION_RESTARTED=true
-    FOUNDATION_LAST_RESTART_TS=$(date +%s)
-fi
+log_step "HEARTBEAT $SCRIPT_VERSION — mount: $NZB_MOUNT | API restarts: $(api_configured && echo enabled || echo disabled)"
 
-for container in $ENABLERS; do
-    if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" != "true" ]; then
-        log_step "[!] $container is down. Starting..."
-        docker start "$container" > /dev/null 2>&1
-        FOUNDATION_RESTARTED=true
-    fi
-done
-
-if [[ "$FOUNDATION_RESTARTED" == "true" ]]; then
-    log_step "WAITING: Giving foundation containers 30s to initialize..."
-    sleep 30
-fi
-
-# --- SECTION 2.4: INDEPENDENT MOUNT VALIDATION ---
-N_CUR_FAIL=${N_FAIL_COUNT:-0}
-D_CUR_FAIL=${D_FAIL_COUNT:-0}
-DEC_LAST_RECOVERY_TS=${DEC_LAST_RECOVERY_TS:-0}
-NZB_VALIDATION_SUBFOLDER="$NZB_MOUNT/completed-symlinks"
-
-if [[ "$HARD_RESET" == "N" ]]; then
-    # --- NzbDAV ---
-    log_step "CHECKING: NzbDAV Mount integrity..."
-    NZB_MOUNT_ALIVE=false
-
-    if [ "$(docker inspect -f '{{.State.Running}}' "$DUMB_CONTAINER" 2>/dev/null)" == "true" ]; then
-        N_COUNT=0
-        while [ $N_COUNT -lt 5 ]; do
-            if timeout $((5 * PATIENCE_MULT))s ls "$NZB_VALIDATION_SUBFOLDER" > /dev/null 2>&1; then
-                NZB_MOUNT_ALIVE=true
-                log_step "Passed: NzbDAV is UP."
-                break
-            fi
-            log_step "WAITING: NzbDAV mount stalling (Attempt $((N_COUNT + 1))/5)..."
-            sleep $((6 * PATIENCE_MULT))
-            ((N_COUNT++))
-        done
-    else
-        log_step "[!] $DUMB_CONTAINER is dead. Bypassing NzbDAV patience window..."
-    fi
-
-    if [[ "$NZB_MOUNT_ALIVE" == "true" ]]; then
-        [[ "$NZB_STATE" != "UP" ]] && NZB_STATE="UP" && NZB_START_TS=$(date +%s)
-        {
-            echo "N_FAIL_COUNT=0"
-            echo "D_FAIL_COUNT=$D_CUR_FAIL"
-            echo "NZB_STATE=\"$NZB_STATE\""
-            echo "NZB_START_TS=\"$NZB_START_TS\""
-            echo "DEC_STATE=\"$DEC_STATE\""
-            echo "DEC_START_TS=\"$DEC_START_TS\""
-            echo "DEC_LAST_RECOVERY_TS=$DEC_LAST_RECOVERY_TS"
-            echo "FOUNDATION_LAST_RESTART_TS=$FOUNDATION_LAST_RESTART_TS"
-            echo "TOTAL_LMP_PRIMED=${TOTAL_LMP_PRIMED:-0}"
-        } > "$STATE_FILE"
-        N_CUR_FAIL=0
-    else
-        log_step "[!] Failed: NzbDAV is DOWN."
-        send_notification "Mount Down" "NzbDAV mount integrity check failed at $NZB_MOUNT" "alert"
-        [[ "$NZB_STATE" != "DOWN" ]] && NZB_STATE="DOWN" && NZB_START_TS=$(date +%s)
-    fi
-
-    # --- Decypharr (DFS via realdebrid subpath) ---
-    if [[ -n "$DEC_MOUNT" ]]; then
-        log_step "CHECKING: Decypharr Mount integrity..."
-        DEC_MOUNT_ALIVE=false
-
-        if [ "$(docker inspect -f '{{.State.Running}}' "$DUMB_CONTAINER" 2>/dev/null)" == "true" ]; then
-            D_COUNT=0
-            while [ $D_COUNT -lt 5 ]; do
-                if { timeout $((5 * PATIENCE_MULT))s ls -d "$DEC_MOUNT/__all__" > /dev/null 2>&1 && \
-                     timeout $((5 * PATIENCE_MULT))s ls "$DEC_MOUNT/version.txt" > /dev/null 2>&1; }; then
-                    DEC_MOUNT_ALIVE=true
-                    log_step "Passed: Decypharr is UP."
-                    break
-                fi
-                log_step "WAITING: Decypharr mount not ready (Attempt $((D_COUNT + 1))/5)..."
-                sleep $((6 * PATIENCE_MULT))
-                ((D_COUNT++))
-            done
-        else
-            log_step "[!] $DUMB_CONTAINER is dead. Bypassing Decypharr patience window..."
-        fi
-
-        if [[ "$DEC_MOUNT_ALIVE" == "false" ]]; then
-            log_step "[!] Failed: Decypharr is DOWN."
-            NOW_TS=$(date +%s)
-            LAST_RESTART=$(( DEC_LAST_RECOVERY_TS > FOUNDATION_LAST_RESTART_TS ? DEC_LAST_RECOVERY_TS : FOUNDATION_LAST_RESTART_TS ))
-            COOLDOWN_REMAINING=$(( RECOVERY_COOLDOWN_SEC - (NOW_TS - LAST_RESTART) ))
-
-            if [[ "$LAST_RESTART" -gt 0 ]] && [[ "$COOLDOWN_REMAINING" -gt 0 ]]; then
-                log_step "[!] COOLDOWN: Skipping Decypharr restart (${COOLDOWN_REMAINING}s remaining of ${RECOVERY_COOLDOWN_SEC}s window, fail count $D_CUR_FAIL/$MAX_FAILURES)."
-            else
-                log_step "Entering Recovery..."
-
-                for container in $ALL_CONSUMERS; do
-                    if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" == "true" ]; then
-                        log_step "Stopping Consumer: $container..."
-                        docker stop "$container" > /dev/null 2>&1
-                    fi
-                done
-
-                log_step "FIX: Restarting $DUMB_CONTAINER to recover Decypharr..."
-                docker restart "$DUMB_CONTAINER" > /dev/null 2>&1
-                DEC_START_TS=$(date +%s)
-                DEC_LAST_RECOVERY_TS=$(date +%s)
-
-                D_POST_COUNT=0
-                while [ $D_POST_COUNT -lt 5 ]; do
-                    sleep $((12 * PATIENCE_MULT))
-                    if { timeout $((5 * PATIENCE_MULT))s ls -d "$DEC_MOUNT/__all__" > /dev/null 2>&1 && \
-                         timeout $((5 * PATIENCE_MULT))s ls "$DEC_MOUNT/version.txt" > /dev/null 2>&1; }; then
-                        DEC_MOUNT_ALIVE=true
-                        log_step "RECOVERY: Decypharr is UP after restart."
-                        break
-                    fi
-                    log_step "WAITING: Decypharr stabilizing after restart (Attempt $((D_POST_COUNT + 1))/5)..."
-                    ((D_POST_COUNT++))
-                done
-
-                if [[ "$DEC_MOUNT_ALIVE" == "false" ]]; then
-                    log_step "[!] CRITICAL: Decypharr recovery failed."
-                    send_notification "Mount Down" "Decypharr recovery failed at $DEC_MOUNT." "alert"
-                    D_CUR_FAIL=$((D_CUR_FAIL + 1))
-                fi
-            fi
-        fi
-
-        if [[ "$DEC_MOUNT_ALIVE" == "true" ]]; then
-            if [[ "$DEC_STATE" != "UP" ]]; then DEC_STATE="UP"; DEC_START_TS=$(date +%s); fi
-            D_CUR_FAIL=0
-        else
-            if [[ "$DEC_STATE" != "DOWN" ]]; then DEC_STATE="DOWN"; DEC_START_TS=$(date +%s); fi
-        fi
-    fi
-else
-    NZB_MOUNT_ALIVE=false
-fi
-
-# --- SECTION 3.1: MOUNT RECOVERY LOOP ---
-RECOVERY_FAILED=false
-if [[ "$HARD_RESET" == "N" ]] && [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
-    log_step "REBUILD: Attempting mount recovery via container restart..."
-
-    for container in $ALL_CONSUMERS; do
-        if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" == "true" ]; then
-            log_step "Stopping Consumer: $container..."
-            docker stop "$container" > /dev/null 2>&1
-        fi
-    done
-
-    NOW_TS=$(date +%s)
-    COOLDOWN_REMAINING=$(( RECOVERY_COOLDOWN_SEC - (NOW_TS - FOUNDATION_LAST_RESTART_TS) ))
-
-    if [[ "$FOUNDATION_LAST_RESTART_TS" -gt 0 ]] && [[ "$COOLDOWN_REMAINING" -gt 0 ]]; then
-        log_step "[!] COOLDOWN: Skipping NzbDAV recovery restart (${COOLDOWN_REMAINING}s remaining of ${RECOVERY_COOLDOWN_SEC}s window, fail count $N_CUR_FAIL/$MAX_FAILURES)."
-        RECOVERY_FAILED=true
-        {
-            echo "N_FAIL_COUNT=$N_CUR_FAIL"
-            echo "D_FAIL_COUNT=$D_CUR_FAIL"
-            echo "NZB_STATE=\"$NZB_STATE\""
-            echo "NZB_START_TS=\"$NZB_START_TS\""
-            echo "DEC_STATE=\"$DEC_STATE\""
-            echo "DEC_START_TS=\"$DEC_START_TS\""
-            echo "DEC_LAST_RECOVERY_TS=$DEC_LAST_RECOVERY_TS"
-            echo "FOUNDATION_LAST_RESTART_TS=$FOUNDATION_LAST_RESTART_TS"
-            echo "TOTAL_LMP_PRIMED=${TOTAL_LMP_PRIMED:-0}"
-        } > "$STATE_FILE"
-    else
-        log_step "FIX: Restarting $DUMB_CONTAINER..."
-        docker restart "$DUMB_CONTAINER" > /dev/null 2>&1
-        FOUNDATION_LAST_RESTART_TS=$(date +%s)
-
-        COUNT=0
-        while [ $COUNT -lt 5 ]; do
-            sleep $((12 * PATIENCE_MULT))
-            if timeout $((5 * PATIENCE_MULT))s ls "$NZB_VALIDATION_SUBFOLDER" > /dev/null 2>&1; then
-                log_step "SUCCESS: NzbDAV mount stabilized."
-                send_notification "Mount Success" "NzbDAV mount has been successfully restored." "normal"
-                NZB_STATE="UP"
-                NZB_START_TS=$(date +%s)
-                {
-                    echo "N_FAIL_COUNT=0"
-                    echo "D_FAIL_COUNT=$D_CUR_FAIL"
-                    echo "NZB_STATE=\"$NZB_STATE\""
-                    echo "NZB_START_TS=\"$NZB_START_TS\""
-                    echo "DEC_STATE=\"$DEC_STATE\""
-                    echo "DEC_START_TS=\"$DEC_START_TS\""
-                    echo "DEC_LAST_RECOVERY_TS=$DEC_LAST_RECOVERY_TS"
-                    echo "FOUNDATION_LAST_RESTART_TS=$FOUNDATION_LAST_RESTART_TS"
-                    echo "TOTAL_LMP_PRIMED=${TOTAL_LMP_PRIMED:-0}"
-                } > "$STATE_FILE"
-                NZB_MOUNT_ALIVE=true
-                RECOVERY_FAILED=false
-                break
-            fi
-            log_step "WAITING: Mount stabilizing (Attempt $((COUNT + 1))/5)..."
-            ((COUNT++))
-        done
-
-        if [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
-            RECOVERY_FAILED=true
-            N_CUR_FAIL=$((N_CUR_FAIL + 1))
-            {
-                echo "N_FAIL_COUNT=$N_CUR_FAIL"
-                echo "D_FAIL_COUNT=$D_CUR_FAIL"
-                echo "NZB_STATE=\"$NZB_STATE\""
-                echo "NZB_START_TS=\"$NZB_START_TS\""
-                echo "DEC_STATE=\"$DEC_STATE\""
-                echo "DEC_START_TS=\"$DEC_START_TS\""
-                echo "DEC_LAST_RECOVERY_TS=$DEC_LAST_RECOVERY_TS"
-                echo "FOUNDATION_LAST_RESTART_TS=$FOUNDATION_LAST_RESTART_TS"
-                echo "TOTAL_LMP_PRIMED=${TOTAL_LMP_PRIMED:-0}"
-            } > "$STATE_FILE"
-        fi
-    fi
-fi
-
-# --- SECTION 3.2: NUCLEAR JUNCTION ---
-TRIGGER_HARD_RESET=false
-if [[ "$HARD_RESET" == "Y" ]]; then
-    log_step "MANUAL RESET: Executing requested purge..."
-    TRIGGER_HARD_RESET=true
-elif { [[ "$RECOVERY_FAILED" == "true" ]] && [[ "$N_CUR_FAIL" -ge "$MAX_FAILURES" ]]; } || [[ "$D_CUR_FAIL" -ge "$MAX_FAILURES" ]]; then
-    log_step "[CRITICAL] Recovery failed and threshold ($MAX_FAILURES) reached. (NzbDAV=$N_CUR_FAIL Decypharr=$D_CUR_FAIL)"
-    TRIGGER_HARD_RESET=true
-fi
-
-if [[ "$TRIGGER_HARD_RESET" == "true" ]]; then
-    log_step "NUCLEAR OPTION: Stopping $DUMB_CONTAINER and resetting state..."
-    send_notification "Forced Reset" "A forced reset has been triggered. Restarting DUMB-2026." "alert"
-
-    for container in $ALL_CONSUMERS; do
-        if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" == "true" ]; then
-            log_step "Stopping Consumer: $container..."
-            docker stop "$container" > /dev/null 2>&1
-        fi
-    done
-
-    log_step "Stopping $DUMB_CONTAINER..."
-    docker stop "$DUMB_CONTAINER" > /dev/null 2>&1
-
-    if [[ "$HARD_RESET" == "Y" ]] && [[ -d "$RCLONE_CACHE_DIR" ]]; then
-        log_step "Wiping rclone VFS cache at $RCLONE_CACHE_DIR..."
-        rm -rf "${RCLONE_CACHE_DIR:?}"/*
-        log_step "SUCCESS: Cache wiped."
-    fi
-
-    sleep 5
-    log_step "Starting $DUMB_CONTAINER..."
-    docker start "$DUMB_CONTAINER" > /dev/null 2>&1
-
-    NZB_STATE="DOWN"
-    NZB_START_TS=$(date +%s)
-    DEC_STATE="DOWN"
-    DEC_START_TS=$(date +%s)
-    {
-        echo "N_FAIL_COUNT=0"
-        echo "D_FAIL_COUNT=0"
-        echo "NZB_STATE=\"$NZB_STATE\""
-        echo "NZB_START_TS=\"$NZB_START_TS\""
-        echo "DEC_STATE=\"$DEC_STATE\""
-        echo "DEC_START_TS=\"$DEC_START_TS\""
-        echo "DEC_LAST_RECOVERY_TS=0"
-        echo "FOUNDATION_LAST_RESTART_TS=$(date +%s)"
-        echo "TOTAL_LMP_PRIMED=0"
-    } > "$STATE_FILE"
-    log_step "SUCCESS: Nuclear Cleanup complete. Counter reset. EXITING."
+if [ "$HARD_RESET" = "Y" ]; then
+    log_step "MANUAL RESET requested."
+    hard_reset "Y"
+    log_step "Manual hard reset complete. EXITING."
     exit 0
 fi
 
-if [[ "$NZB_MOUNT_ALIVE" == "false" ]]; then
-    log_step "[ABORT] Mount recovery failed. Threshold not yet reached ($N_CUR_FAIL/$MAX_FAILURES). Exiting."
+# --- 3.1 FOUNDATION ---
+FOUNDATION_STARTED=false
+if ! container_running "$DUMB_CONTAINER"; then
+    log_step "[!] $DUMB_CONTAINER is down. Starting..."
+    docker start "$DUMB_CONTAINER" > /dev/null 2>&1
+    FOUNDATION_LAST_RESTART_TS=$(date +%s)
+    FOUNDATION_STARTED=true
+fi
+for container in $ENABLERS; do
+    if ! container_running "$container"; then
+        log_step "[!] $container is down. Starting..."
+        docker start "$container" > /dev/null 2>&1
+        FOUNDATION_STARTED=true
+    fi
+done
+if [ "$FOUNDATION_STARTED" = "true" ]; then
+    log_step "WAITING: ${FOUNDATION_WAIT_SEC}s for containers to initialise..."
+    sleep "$FOUNDATION_WAIT_SEC"
+fi
+
+# --- 3.2 PROBE ---
+MOUNT_OK=false
+BACKEND_OK=false
+attempt=1
+while [ "$attempt" -le "$PROBE_ATTEMPTS" ]; do
+    mount_up && MOUNT_OK=true || MOUNT_OK=false
+    backend_up && BACKEND_OK=true || BACKEND_OK=false
+    [ "$MOUNT_OK" = "true" ] && [ "$BACKEND_OK" = "true" ] && break
+    log_step "WAITING: probe failed (mount=$MOUNT_OK backend=$BACKEND_OK, attempt $attempt/$PROBE_ATTEMPTS)..."
+    [ "$attempt" -lt "$PROBE_ATTEMPTS" ] && sleep 6
+    attempt=$((attempt + 1))
+done
+
+if [ "$MOUNT_OK" = "true" ] && [ "$BACKEND_OK" = "true" ]; then
+    if [ "$NZB_STATE" = "DOWN" ]; then
+        send_notification "Mount Restored" "NzbDAV mount at $NZB_MOUNT is back." "normal"
+    fi
+    set_nzb_state "UP"
+    N_FAIL_COUNT=0
+    save_state
+    log_step "Passed: NzbDAV is UP (fail count reset)."
+    exit 0
+fi
+
+# --- 3.3 RECOVERY LADDER ---
+log_step "[!] Failed: NzbDAV is DOWN (mount=$MOUNT_OK backend=$BACKEND_OK, fail count $N_FAIL_COUNT/$MAX_FAILURES)."
+if [ "$NZB_STATE" != "DOWN" ]; then
+    send_notification "Mount Down" "NzbDAV check failed at $NZB_MOUNT (mount=$MOUNT_OK backend=$BACKEND_OK). Recovering." "alert"
+fi
+set_nzb_state "DOWN"
+
+if [ "$N_FAIL_COUNT" -ge "$MAX_FAILURES" ]; then
+    if container_restart_allowed; then
+        log_step "[CRITICAL] $MAX_FAILURES consecutive recoveries failed."
+        hard_reset "N"
+        log_step "Hard reset done; mount will be re-checked next run. EXITING."
+    else
+        save_state
+    fi
     exit 1
 fi
 
-# --- SECTION 4: PRIMING & RESTORATION ---
-log_step "INITIATING: Intelligent Priming (Library Only)..."
-
-START_TIME=$(date +%s)
-LAST_RUN_TS=${LAST_PRIMED_TS:-0}
-LMP_RUN_COUNT=0
-CUR_TOTAL_LMP=${TOTAL_LMP_PRIMED:-0}
-
-log_step "Checking $LOCAL_MEDIA_PATH for new files..."
-FIND_EXCLUDES=""
-for d in $EXCLUDE_DIRS; do
-    FIND_EXCLUDES="$FIND_EXCLUDES ! -path \"*/${d#/}/*\""
-done
-for e in $EXCLUDE_EXTS; do
-    FIND_EXCLUDES="$FIND_EXCLUDES ! -name \"*$e\""
-done
-
-eval "nice -n 19 ionice -c 3 find \"$LOCAL_MEDIA_PATH\" -type l $FIND_EXCLUDES -newermt \"@$LAST_RUN_TS\" -exec ls -d {} + > /dev/null 2>&1"
-
-if [[ "$ALL_HISTORICAL_PRIMED" != "TRUE" ]]; then
-    log_step "Resuming historical prime for Media Path..."
-    mapfile -t LMP_TARGETS < <(eval "nice -n 19 ionice -c 3 find \"$LOCAL_MEDIA_PATH\" -type l $FIND_EXCLUDES -not -newermt \"@${HISTORICAL_MARKER:-$(date +%s)}\" -printf \"%T@ %p\n\" | sort -rn | cut -d' ' -f2-")
-
-    if [ ${#LMP_TARGETS[@]} -gt 0 ]; then
-        for file in "${LMP_TARGETS[@]}"; do
-            nice -n 19 ionice -c 3 ls -d "$file" > /dev/null 2>&1
-            ((LMP_RUN_COUNT++))
-            NEW_LMP_MARKER=$(stat -c %Y "$file" 2>/dev/null)
-            [ $(( $(date +%s) - START_TIME )) -ge "$PRIME_MAX_TIME" ] && break
-        done
-    else
-        ALL_HISTORICAL_PRIMED="TRUE"
+# Rung selection: fail #0 → rclone, #1 → InfiniDysk + rclone, #2+ → container.
+# A dead backend skips straight to restarting InfiniDysk — restarting rclone alone
+# can't bring the WebDAV server back.
+RUNG="container"
+if api_configured; then
+    if [ "$N_FAIL_COUNT" -eq 0 ] && [ "$BACKEND_OK" = "true" ]; then
+        RUNG="rclone"
+    elif [ "$N_FAIL_COUNT" -le 1 ]; then
+        RUNG="infinidysk"
     fi
 fi
-CUR_TOTAL_LMP=$((CUR_TOTAL_LMP + LMP_RUN_COUNT))
-log_step "$LMP_RUN_COUNT new files found ... $CUR_TOTAL_LMP total files in the library."
 
-{
-    echo "N_FAIL_COUNT=${N_CUR_FAIL:-0}"
-    echo "D_FAIL_COUNT=${D_CUR_FAIL:-0}"
-    echo "LAST_PRIMED_TS=$(date +%s)"
-    echo "HISTORICAL_MARKER=${NEW_LMP_MARKER:-$HISTORICAL_MARKER}"
-    echo "ALL_HISTORICAL_PRIMED=$ALL_HISTORICAL_PRIMED"
-    echo "NZB_STATE=\"$NZB_STATE\""
-    echo "NZB_START_TS=\"$NZB_START_TS\""
-    echo "DEC_STATE=\"$DEC_STATE\""
-    echo "DEC_START_TS=\"$DEC_START_TS\""
-    echo "DEC_LAST_RECOVERY_TS=${DEC_LAST_RECOVERY_TS:-0}"
-    echo "FOUNDATION_LAST_RESTART_TS=${FOUNDATION_LAST_RESTART_TS:-0}"
-    echo "TOTAL_LMP_PRIMED=$CUR_TOTAL_LMP"
-} > "$STATE_FILE"
-
-# --- SECTION 5: RESTORATION ---
-log_step "RESTORATION: Starting Consumers..."
-if [[ "$NZB_MOUNT_ALIVE" == "true" ]] && [[ "$DEC_MOUNT_ALIVE" == "true" ]]; then
-    for container in $ALL_CONSUMERS; do
-        docker start "$container" > /dev/null 2>&1
-    done
-else
-    log_step "[ABORT] Restoration skipped. One or more mounts are offline."
+ACTION_TAKEN=false
+if [ "$RUNG" != "container" ]; then
+    if api_login; then
+        if [ "$RUNG" = "rclone" ]; then
+            api_restart "$DUMB_RCLONE_PROCESS" && ACTION_TAKEN=true
+        else
+            api_restart "$DUMB_NZB_PROCESS" && api_restart "$DUMB_RCLONE_PROCESS" && ACTION_TAKEN=true
+        fi
+    else
+        log_step "[!] API: login to $DUMB_API_URL failed — falling back to a container restart."
+    fi
+    if [ "$ACTION_TAKEN" = "false" ]; then
+        RUNG="container"
+    fi
 fi
 
-# --- SECTION 6: FINAL SUMMARY ---
-log_step "FINALIZING: Generating environment report..."
+if [ "$RUNG" = "container" ]; then
+    if ! container_restart_allowed; then
+        # Cooldown skip is not a failed recovery — don't count it.
+        save_state
+        exit 1
+    fi
+    log_step "FIX: docker restart $DUMB_CONTAINER..."
+    docker restart "$DUMB_CONTAINER" > /dev/null 2>&1
+    FOUNDATION_LAST_RESTART_TS=$(date +%s)
+    ACTION_TAKEN=true
+fi
 
-CUR_LOAD=$(awk '{print $1}' /proc/loadavg)
-RAM_TOTAL=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-RAM_FREE=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
-RAM_PERC=$(awk "BEGIN {printf \"%.1f\", ($RAM_FREE/$RAM_TOTAL)*100}")
+LAST_RECOVERY_TS=$(date +%s)
+LAST_RECOVERY_ACTION="$RUNG"
 
-calculate_duration() {
-    local diff=$(($(date +%s) - $1))
-    local days=$((diff / 86400))
-    local hours=$(( (diff % 86400) / 3600 ))
-    local mins=$(( (diff % 3600) / 60 ))
-    [ $days -gt 0 ] && echo "${days}d ${hours}h ${mins}m" || ([ $hours -gt 0 ] && echo "${hours}h ${mins}m" || echo "${mins}m")
-}
+if wait_for_mount; then
+    set_nzb_state "UP"
+    N_FAIL_COUNT=0
+    save_state
+    send_notification "Mount Restored" "NzbDAV mount recovered via $RUNG restart." "normal"
+    exit 0
+fi
 
-NZB_TIME=$(calculate_duration ${NZB_START_TS:-$(date +%s)})
-DEC_TIME=$(calculate_duration ${DEC_START_TS:-$(date +%s)})
-
-echo ""
-echo "Status Summary:"
-echo "NzbDAV ${NZB_STATE} (${NZB_TIME}) : Decypharr ${DEC_STATE} (${DEC_TIME}) | Primed ${TOTAL_LMP_PRIMED:-0} | Load ${CUR_LOAD} | RAM FREE: ${RAM_PERC}%"
-echo "--------------------------------------------------------------------------------------"
-log_step "STATUS: All Systems Operational."
-exit 0
+N_FAIL_COUNT=$((N_FAIL_COUNT + 1))
+save_state
+log_step "[!] Recovery via $RUNG did not bring the mount back (fail count $N_FAIL_COUNT/$MAX_FAILURES)."
+send_notification "Mount Down" "NzbDAV recovery via $RUNG failed ($N_FAIL_COUNT/$MAX_FAILURES)." "alert"
+exit 1

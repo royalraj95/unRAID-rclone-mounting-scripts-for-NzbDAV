@@ -1,106 +1,94 @@
 #!/bin/bash
 # ======================================================================================
-# SCRIPT: Symlink Sentinel (v1.0RC1-DUMB)
-# DESCRIPTION: Detects broken symlinks pointing at DUMB-2026's debrid mounts,
-#              calculates library health, and triggers DUMB's internal *Arrs + Plex refresh.
+# SCRIPT: Symlink Sentinel (DUMB Edition)
+# VERSION: v2.0-DUMB
+# DESCRIPTION: Finds library symlinks whose NzbDAV/InfiniDysk item no longer exists,
+#              removes them (dry-run by default), then asks the owning *Arr to rescan
+#              (and optionally re-search) that one movie/series and Plex to scan that
+#              one folder.
 #
-# NOTE ON PATHS: Symlinks created by DUMB's internal *Arrs use the CONTAINER-SIDE path
-# (/mnt/debrid/...) because the *Arr containers bind /mnt/user/data/remote as /mnt/debrid,
-# the same as DUMB does. NZB_MOUNT and DEC_MOUNT here must match the target path written
-# INTO the symlink, not the host-side path.
+# HOW IT KNOWS WHAT'S BROKEN — zero FUSE traffic:
+#   DUMB's *Arrs import NzbDAV content as symlinks of the form
+#     /mnt/debrid/nzbdav/.ids/f/d/e/1/9/fde1946f-3b99-42c7-8ebf-7a5f7dff3738
+#   The trailing UUID is the item's primary key in InfiniDysk's own database
+#   (DavItems.Id). So the Sentinel:
+#     1. lists every library symlink and its target (find -printf, inode reads only),
+#     2. exports every DavItems.Id with one read-only sqlite3 query,
+#     3. flags each .ids link whose UUID isn't in the export.
+#   Step 1 runs before step 2 so an item imported mid-run can't look missing.
+#   Links into the retired Decypharr/Real-Debrid mount are flagged when their target
+#   is gone. Any other target is counted as "unknown" and left alone.
 #
-# NOTE ON *ARR INSTANCES: This Sentinel calls DUMB's INTERNAL *Arrs (exposed via Docker
-# port mappings on the host). The independent binhex *Arr stack manages local libraries
-# (tv/, movies-hd/, etc.) and has no relationship to the -remote symlink folders.
+# WHAT IT DOESN'T DO: InfiniDysk already health-checks and repairs its own files
+# (repair.enable) and removes items no symlink uses (remove-orphaned). The Sentinel
+# only covers the opposite gap: symlinks left behind after their item is gone.
+#
+# NOTE ON *ARR INSTANCES: This calls DUMB's INTERNAL *Arrs. The independent binhex *Arr
+# stack manages local libraries (tv/, movies-hd/, ...) and is never touched.
 # ======================================================================================
 
-# --- 1. MEDIA SERVER CONFIG ---
-# Replace placeholders with your own host/IP, port mappings, and API tokens.
-PLEX_URL="http://<UNRAID_HOST_OR_IP>:<PLEX_PORT>"
-PLEX_TOKEN="<YOUR_PLEX_TOKEN>"                # Plex WebUI → any item → Get Info → View XML → X-Plex-Token in URL
+# --------------------------------------------------------------------------------------
+# 1. USER CONFIGURATION (secrets and URLs belong in dumb.conf — see dumb.conf.example)
+# --------------------------------------------------------------------------------------
 
-EMBY_URL=""                                # Disabled — leave blank
-EMBY_API=""
+DUMB_CONF="${DUMB_CONF:-/mnt/user/appdata/other/scripts/dumb-2026/dumb.conf}"
+# shellcheck source=/dev/null
+[ -f "$DUMB_CONF" ] && source "$DUMB_CONF"
 
-# --- 2. PROVIDER DEFINITIONS ---
-# DUMB's internal *Arrs — host-port mappings exposed by DUMB-2026.
-# NOT the binhex *Arrs (binhex-sonarr, binhex-radarr-UHD, etc. are independent).
-# API keys: each app's WebUI → Settings → General → API Key.
+# --- SAFETY & PACE ---
+DRY_RUN_GLOBAL="${DRY_RUN_GLOBAL:-Y}"         # Y = log what would be deleted, touch nothing
+DELETES_PER_RUN="${DELETES_PER_RUN:-25}"       # max deletions per run
+MAX_BROKEN_PER_LIB="${MAX_BROKEN_PER_LIB:-150}"   # stop collecting candidates in a library after this many
+MAX_BROKEN_BEFORE_HALT="${MAX_BROKEN_BEFORE_HALT:-500}"  # CIRCUIT BREAKER: total broken above this → hold file, no deletes
+ROLLING_24H_LIMIT="${ROLLING_24H_LIMIT:-200}"   # max deletions across all runs in 24h
+MIN_IDS="${MIN_IDS:-1000}"                     # abort if InfiniDysk reports fewer items than this
+ID_DROP_MAX_PCT="${ID_DROP_MAX_PCT:-20}"       # abort if the item count fell more than this % since the last good run
+SEARCH_AFTER_DELETE="${SEARCH_AFTER_DELETE:-Y}"  # also trigger a search for the affected movie/series (needs jq)
 
-SONARR_HD_URL="http://<UNRAID_HOST_OR_IP>:<SONARR_HD_PORT>"
-SONARR_HD_API="<YOUR_SONARR_HD_API_KEY>"
-
-SONARR_4K_URL="http://<UNRAID_HOST_OR_IP>:<SONARR_4K_PORT>"
-SONARR_4K_API="<YOUR_SONARR_4K_API_KEY>"
-
-RADARR_HD_URL="http://<UNRAID_HOST_OR_IP>:<RADARR_HD_PORT>"
-RADARR_HD_API="<YOUR_RADARR_HD_API_KEY>"
-
-RADARR_4K_URL="http://<UNRAID_HOST_OR_IP>:<RADARR_4K_PORT>"
-RADARR_4K_API="<YOUR_RADARR_4K_API_KEY>"
-
-# Disabled
-LIDARR_URL=""; LIDARR_API=""
-SPORTARR_URL=""; SPORTARR_API=""
-
-# --- 3. SAFETY & PACE CONFIGURATION ---
-DRY_RUN_GLOBAL="Y"               # START IN DRY RUN — flip to N after confirming audit log looks right
-MAX_BROKEN_PER_LIB=150           # Per-library scan cap: stop counting after this many per library
-MAX_BROKEN_BEFORE_HALT=500       # CIRCUIT BREAKER: abort if total broken across all libraries exceeds this
-ROLLING_24H_LIMIT=200            # FUEL GAUGE: max total deletions in 24 hours across all runs
-UPTIME_MATURITY_REQUIRED=3600    # Seconds of mount stability before Sentinel will act (prevents startup race)
-DELETES_PER_RUN=5                # Max deletions per script run (tune up once stable)
-
-# --- 4. LIBRARY MAPPING ---
-# Format: "Path|Name|Arr_Key|Mode|Notify_Type|Media_ID|Min_Depth|Max_Depth"
-#
-# Arr_Key must match a declared variable prefix above:
-#   SONARR_HD → SONARR_HD_URL + SONARR_HD_API → RescanSeries
-#   RADARR_4K → RADARR_4K_URL + RADARR_4K_API → RefreshMovie (any key containing RADARR)
-#
-# Media_ID = Plex library section key:
-#   key=1 Movies-4k | key=2 Movies-HD | key=4 TV Shows | key=10 TV Shows-4K
-#
-# Only scan -remote libraries (DUMB-managed symlinks). Do NOT add local folders
-# (tv/, movies-hd/, etc.) — those are managed by the independent binhex stack.
-
+# --- LIBRARY MAPPING ---
+# Format: "Path|Name|Arr_Key|Mode|Notify_Type|Plex_Section|Min_Depth|Max_Depth"
+#   Arr_Key must match a <KEY>_URL / <KEY>_API pair (dumb.conf). Keys containing RADARR
+#   are treated as Radarr, everything else as Sonarr.
+#   Plex_Section = library key from /library/sections:
+#     1 Movies-4k | 2 Movies-HD | 4 TV Shows | 10 TV Shows - 4K
+# Only DUMB-managed -remote libraries. Never add local folders (tv/, movies-hd/, ...).
+if ! declare -p LIBRARIES > /dev/null 2>&1; then
 LIBRARIES=(
     "/mnt/user/data/media/tv-remote|TV Shows|SONARR_HD|LIVE|PLEX|4|3|4"
     "/mnt/user/data/media/tv-remote-4k|TV Shows 4K|SONARR_4K|LIVE|PLEX|10|3|4"
     "/mnt/user/data/media/movies-hd-remote|Movies HD|RADARR_HD|LIVE|PLEX|2|2|3"
     "/mnt/user/data/media/movies-uhd-remote|Movies 4K|RADARR_4K|LIVE|PLEX|1|2|3"
 )
+fi
 
-# --- 5. PATHS & FILES ---
-STATE_DB="/mnt/user/appdata/other/scripts/dumb-2026/sentinel_state.db"
-AUDIT_LOG="/mnt/user/appdata/other/scripts/dumb-2026/sentinel_audit.log"
-HOLD_FILE="/mnt/user/appdata/other/scripts/dumb-2026/SENTINEL_HOLD.txt"
-PRIME_STATE="/mnt/user/appdata/other/scripts/dumb-2026/prime_state.db"
+# --- SOURCES OF TRUTH ---
+INFINIDYSK_DB="${INFINIDYSK_DB:-/mnt/user/appdata/DUMB-2026/data/nzbdav/db.sqlite}"
+NZB_IDS_PREFIX="${NZB_IDS_PREFIX:-/mnt/debrid/nzbdav/.ids/}"   # container-side, as written into symlinks
+LEGACY_PREFIXES="${LEGACY_PREFIXES-/mnt/debrid/decypharr /mnt/debrid/realdebrid /mnt/debrid/zurg}"
+RSHARED_CONTAINER="${RSHARED_CONTAINER:-/mnt/debrid}"           # container side of the shared bind...
+RSHARED_HOST="${RSHARED_HOST:-/mnt/user/data/remote}"            # ...and its host side
+HOST_MEDIA_ROOT="${HOST_MEDIA_ROOT:-/mnt/user/data/media}"       # media root on the host...
+APP_MEDIA_ROOT="${APP_MEDIA_ROOT:-/data/media}"                  # ...as the *Arrs and Plex see it
+
+# --- MEDIA SERVER ---
+PLEX_URL="${PLEX_URL:-http://127.0.0.1:32400}"
+PLEX_TOKEN="${PLEX_TOKEN:-}"
+
+# --- PATHS & FILES ---
+STATE_DB="${STATE_DB:-/mnt/user/appdata/other/scripts/dumb-2026/sentinel_state.db}"     # deletion timestamps (24h cap)
+META_FILE="${META_FILE:-/mnt/user/appdata/other/scripts/dumb-2026/sentinel_meta}"       # LAST_ID_COUNT etc.
+AUDIT_LOG="${AUDIT_LOG:-/mnt/user/appdata/other/scripts/dumb-2026/sentinel_audit.log}"
+HOLD_FILE="${HOLD_FILE:-/mnt/user/appdata/other/scripts/dumb-2026/SENTINEL_HOLD.txt}"
 BACKUP_PAUSE_FILE="${BACKUP_PAUSE_FILE:-/tmp/dumb-scripts.pause}"
 BACKUP_PROC_PATTERN="${BACKUP_PROC_PATTERN:-(appdata\.backup|ca\.backup2).*backup\.(php|sh)}"
 BACKUP_PAUSE_MAX_AGE_MIN="${BACKUP_PAUSE_MAX_AGE_MIN:-120}"
 
-# Symlink target prefix (container-side) — must match what DUMB's *Arrs write into symlinks.
-# Verified via readlink: targets are /mnt/debrid/decypharr/realdebrid/__all__/...
-NZB_MOUNT="/mnt/debrid/nzbdav"
-DEC_MOUNT="/mnt/debrid/decypharr"
-
-# Path translation: symlink targets use the container-side prefix /mnt/debrid.
-# The host-side equivalent is /mnt/user/data/remote (via the rshared bind).
-# Used to locate __all__ for the pre-scan pack index.
-RSHARED_CONTAINER="/mnt/debrid"
-RSHARED_HOST="/mnt/user/data/remote"
-
-# Minimum number of packs that must be returned from decypharr's __all__ before
-# the Sentinel will act. Protects against a momentarily stale/empty fuse index
-# causing every symlink to appear broken and triggering mass deletion.
-MIN_PACKS_SANITY=100
-
 # --------------------------------------------------------------------------------------
-# 6. MAIN SCRIPT — DO NOT CHANGE BELOW HERE
+# 2. HELPERS
 # --------------------------------------------------------------------------------------
 
 log_it() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
+audit() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$AUDIT_LOG"; }
 
 _backup_in_progress() {
     if [ -f "$BACKUP_PAUSE_FILE" ]; then
@@ -112,201 +100,264 @@ _backup_in_progress() {
     fi
     pgrep -fq "$BACKUP_PROC_PATTERN" 2>/dev/null
 }
+
+arr_post() {  # arr_post <url> <api_key> <json>
+    curl -s -m 30 -o /dev/null -X POST "$1/api/v3/command" \
+        -H "X-Api-Key: $2" -H "Content-Type: application/json" -d "$3"
+}
+
+TMP_DIR=$(mktemp -d)
+cleanup() { rm -rf "$TMP_DIR"; }
+trap cleanup EXIT
+
+# --------------------------------------------------------------------------------------
+# 3. MAIN
+# --------------------------------------------------------------------------------------
+
+mkdir -p "$(dirname "$STATE_DB")"
+touch "$STATE_DB" "$AUDIT_LOG"
+
 if _backup_in_progress; then
     log_it "[PAUSED] appdata backup in progress — skipping run"
     exit 0
 fi
 
-touch "$STATE_DB"
-[ ! -f "$AUDIT_LOG" ] && touch "$AUDIT_LOG"
+if [ -f "$HOLD_FILE" ]; then
+    log_it "ON HOLD: $(head -c 300 "$HOLD_FILE")"
+    log_it "Review $AUDIT_LOG, then delete $HOLD_FILE to resume."
+    exit 1
+fi
 
 echo "------------------------------------------------------------"
-echo " SENTINEL CONFIGURATION"
-echo "------------------------------------------------------------"
+echo " SENTINEL v2.0-DUMB"
+echo " Dry Run:           $DRY_RUN_GLOBAL"
 echo " Deletes Per Run:   $DELETES_PER_RUN"
 echo " Per-Lib Cap:       $MAX_BROKEN_PER_LIB"
 echo " Circuit Breaker:   $MAX_BROKEN_BEFORE_HALT"
 echo " Rolling 24h Limit: $ROLLING_24H_LIMIT"
-echo " Dry Run:           $DRY_RUN_GLOBAL"
-echo " NZB prefix:        $NZB_MOUNT"
-echo " DEC prefix:        $DEC_MOUNT"
+echo " InfiniDysk DB:     $INFINIDYSK_DB"
 echo "------------------------------------------------------------"
 
-# 1. Maturity Check
-if [ -f "$PRIME_STATE" ]; then
-    NZB_START_TS=$(grep "NZB_START_TS" "$PRIME_STATE" | cut -d= -f2 | tr -d '"')
-    if [ -n "$NZB_START_TS" ]; then
-        UPTIME=$(( $(date +%s) - NZB_START_TS ))
-        if [ "$UPTIME" -lt "$UPTIME_MATURITY_REQUIRED" ]; then
-            log_it "STABILITY: Mount is fresh ($((UPTIME/60)) mins). Postponing."
-            exit 0
-        fi
-    fi
+if ! command -v sqlite3 > /dev/null 2>&1; then
+    log_it "ABORT: sqlite3 not found."
+    exit 1
 fi
-
-# 2. PRE-SCAN: Build ground-truth indexes for both mounts (no per-file stats)
-PACK_LIST=$(mktemp)
-NZB_LIST=$(mktemp)
-
-# Decypharr: one readdir of __all__ — pack DIRECTORY names (torrent-level granularity).
-# Decypharr serves this from its in-process torrent registry; one fuse readdir operation.
-DEC_ALL_PATH="${RSHARED_HOST}/decypharr/realdebrid/__all__"
-log_it "PRE-SCAN: Indexing decypharr packs from $DEC_ALL_PATH..."
-find "$DEC_ALL_PATH" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort -u > "$PACK_LIST"
-DEC_PACK_COUNT=$(wc -l < "$PACK_LIST")
-
-if (( DEC_PACK_COUNT < MIN_PACKS_SANITY )); then
-    log_it "ABORT: Only $DEC_PACK_COUNT packs returned — decypharr index may be stale or mount is down. Exiting safely."
-    rm -f "$PACK_LIST" "$NZB_LIST"; exit 1
-fi
-
-# NzbDAV: ONE readdir of completed-symlinks — category dir names only (-maxdepth 1).
-# -maxdepth 3 hung because each subdir triggers an additional WebDAV PROPFIND call.
-# -maxdepth 1 = one PROPFIND, identical cost to decypharr's __all__.
-# Category-level granularity is sufficient: NzbDAV content is downloaded to disk and
-# rarely deleted at the individual file level.
-# Safety: if mount is down, NZB_LIST stays empty — awk skips NzbDAV checks.
-NZB_CS_PATH="${RSHARED_HOST}/nzbdav/completed-symlinks"
-log_it "PRE-SCAN: Indexing NzbDAV categories from $NZB_CS_PATH..."
-find "$NZB_CS_PATH" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort -u > "$NZB_LIST"
-NZB_CAT_COUNT=$(wc -l < "$NZB_LIST")
-
-log_it "PRE-SCAN: $DEC_PACK_COUNT decypharr packs + $NZB_CAT_COUNT NzbDAV categories indexed. Starting scan..."
-
-# 3. SCAN
-TOTAL_BROKEN_GLOBAL=0
-CANDIDATES=()
-
-for ENTRY in "${LIBRARIES[@]}"; do
-    IFS='|' read -r LIB_PATH LIB_NAME LIB_KEY LIB_MODE LIB_NOTIFY LIB_ID LIB_MIN LIB_MAX <<< "$ENTRY"
-    if [ -d "$LIB_PATH" ]; then
-        log_it ">> SCANNING: $LIB_NAME [$LIB_MODE]"
-
-        DEPTH_ARGS=""
-        [ -n "$LIB_MIN" ] && DEPTH_ARGS="$DEPTH_ARGS -mindepth $LIB_MIN"
-        [ -n "$LIB_MAX" ] && DEPTH_ARGS="$DEPTH_ARGS -maxdepth $LIB_MAX"
-
-        # find -printf '%p\t%l\n' reads only symlink inodes — zero fuse contact.
-        # awk loads the pack list once, extracts the pack name from each target string,
-        # and outputs only the links whose pack is absent from the available set.
-        # NzbDAV targets (no realdebrid/__all__/ in path) are silently skipped —
-        # NzbDAV content is kept permanently; mount-level failures are handled by the Heartbeat.
-        LIB_BROKEN_COUNT=0
-        while IFS= read -r broken_link; do
-            CANDIDATES+=("$broken_link|$LIB_NAME|$LIB_KEY|$LIB_MODE|$LIB_NOTIFY|$LIB_ID")
-            ((LIB_BROKEN_COUNT++))
-            [ "$LIB_BROKEN_COUNT" -ge "$MAX_BROKEN_PER_LIB" ] && break
-        done < <(
-            find "$LIB_PATH" $DEPTH_ARGS -type l \
-                \( -lname "${NZB_MOUNT}*" -o -lname "${DEC_MOUNT}*" \) \
-                -printf '%p\t%l\n' 2>/dev/null | \
-            awk -v pack_file="$PACK_LIST" \
-                -v nzb_file="$NZB_LIST" \
-                -v dec_marker="realdebrid/__all__/" \
-                -v nzb_marker="nzbdav/completed-symlinks/" '
-                BEGIN {
-                    while ((getline p < pack_file) > 0) dec_avail[p] = 1
-                    close(pack_file)
-                    while ((getline f < nzb_file) > 0) nzb_avail[f] = 1
-                    close(nzb_file)
-                }
-                {
-                    n = split($0, parts, "\t")
-                    link = parts[1]; target = parts[2]
-
-                    # Decypharr: extract pack name from __all__/PackName/file path
-                    pos = index(target, dec_marker)
-                    if (pos > 0) {
-                        rest = substr(target, pos + length(dec_marker))
-                        slash = index(rest, "/")
-                        pack = (slash > 0) ? substr(rest, 1, slash - 1) : rest
-                        if (pack != "" && !(pack in dec_avail)) print link
-                        next
-                    }
-
-                    # NzbDAV: extract category name only (first component after completed-symlinks/).
-                    # NZB_LIST has category dir names only (-maxdepth 1, one PROPFIND call).
-                    # Skip if NZB_LIST is empty (mount down) — safer than mass-flagging.
-                    pos = index(target, nzb_marker)
-                    if (pos > 0 && length(nzb_avail) > 0) {
-                        rest = substr(target, pos + length(nzb_marker))
-                        slash = index(rest, "/")
-                        category = (slash > 0) ? substr(rest, 1, slash - 1) : rest
-                        if (category != "" && !(category in nzb_avail)) print link
-                    }
-                }
-            '
-        )
-        log_it "  Broken: $LIB_BROKEN_COUNT"
-
-        TOTAL_BROKEN_GLOBAL=$((TOTAL_BROKEN_GLOBAL + LIB_BROKEN_COUNT))
-    fi
-done
-
-# 3. CIRCUIT BREAKER
-if [ "$DRY_RUN_GLOBAL" = "N" ] && [ "$TOTAL_BROKEN_GLOBAL" -gt "$MAX_BROKEN_BEFORE_HALT" ]; then
-    log_it "CRITICAL: Broken links ($TOTAL_BROKEN_GLOBAL) exceeds threshold ($MAX_BROKEN_BEFORE_HALT)."
-    echo "$TOTAL_BROKEN_GLOBAL broken links found. Sentinel Locked." > "$HOLD_FILE"
+if [ ! -r "$INFINIDYSK_DB" ]; then
+    log_it "ABORT: InfiniDysk database not readable at $INFINIDYSK_DB."
     exit 1
 fi
 
-# 4. ROLLING 24H TALLY
+# --- 3.1 SCAN: every symlink + target, no FUSE contact ---
+LINKS_FILE="$TMP_DIR/links.tsv"     # lib_index \t link \t target
+: > "$LINKS_FILE"
+for i in "${!LIBRARIES[@]}"; do
+    IFS='|' read -r LIB_PATH LIB_NAME _ _ _ _ LIB_MIN LIB_MAX <<< "${LIBRARIES[$i]}"
+    if [ ! -d "$LIB_PATH" ]; then
+        log_it "SKIP: $LIB_NAME — $LIB_PATH not found."
+        continue
+    fi
+    DEPTH_ARGS=()
+    [ -n "$LIB_MIN" ] && DEPTH_ARGS+=(-mindepth "$LIB_MIN")
+    [ -n "$LIB_MAX" ] && DEPTH_ARGS+=(-maxdepth "$LIB_MAX")
+    find "$LIB_PATH" "${DEPTH_ARGS[@]}" -type l -printf "$i\t%p\t%l\n" 2>/dev/null >> "$LINKS_FILE"
+done
+TOTAL_LINKS=$(wc -l < "$LINKS_FILE" | tr -d ' ')
+log_it "SCAN: $TOTAL_LINKS symlinks across ${#LIBRARIES[@]} libraries."
+
+# --- 3.2 GROUND TRUTH: InfiniDysk item IDs (read-only, after the scan) ---
+IDS_FILE="$TMP_DIR/ids.txt"
+if ! timeout 300 sqlite3 -readonly "$INFINIDYSK_DB" "SELECT lower(Id) FROM DavItems;" > "$IDS_FILE" 2> "$TMP_DIR/sqlite.err"; then
+    log_it "ABORT: InfiniDysk DB query failed: $(head -c 300 "$TMP_DIR/sqlite.err")"
+    exit 1
+fi
+ID_COUNT=$(wc -l < "$IDS_FILE" | tr -d ' ')
+
+LAST_ID_COUNT=0
+[ -f "$META_FILE" ] && LAST_ID_COUNT=$(grep '^LAST_ID_COUNT=' "$META_FILE" | cut -d= -f2)
+LAST_ID_COUNT=${LAST_ID_COUNT:-0}
+
+if [ "$ID_COUNT" -lt "$MIN_IDS" ]; then
+    log_it "ABORT: InfiniDysk reports only $ID_COUNT items (floor $MIN_IDS) — DB may be resetting. Nothing touched."
+    exit 1
+fi
+if [ "$LAST_ID_COUNT" -gt 0 ] && [ $((ID_COUNT * 100)) -lt $((LAST_ID_COUNT * (100 - ID_DROP_MAX_PCT))) ]; then
+    log_it "ABORT: InfiniDysk item count fell from $LAST_ID_COUNT to $ID_COUNT (>${ID_DROP_MAX_PCT}%). Nothing touched."
+    log_it "If the drop is expected, delete LAST_ID_COUNT from $META_FILE and re-run."
+    exit 1
+fi
+log_it "INDEX: $ID_COUNT InfiniDysk items (last good run: $LAST_ID_COUNT)."
+
+# --- 3.3 CLASSIFY ---
+# Output: BROKEN \t lib \t link \t reason   |   LEGACY \t lib \t link \t target   |   UNKNOWN
+CLASSIFIED="$TMP_DIR/classified.tsv"
+awk -F'\t' -v ids_file="$IDS_FILE" -v ids_prefix="$NZB_IDS_PREFIX" -v legacy="$LEGACY_PREFIXES" '
+    BEGIN {
+        while ((getline id < ids_file) > 0) have[id] = 1
+        close(ids_file)
+        n_legacy = split(legacy, legacy_list, " ")
+    }
+    {
+        lib = $1; link = $2; target = $3
+        if (index(target, ids_prefix) == 1) {
+            n = split(target, parts, "/")
+            uuid = tolower(parts[n])
+            if (!(uuid in have)) print "BROKEN\t" lib "\t" link "\tmissing-id:" uuid
+            next
+        }
+        for (j = 1; j <= n_legacy; j++) {
+            if (legacy_list[j] != "" && index(target, legacy_list[j]) == 1) {
+                print "LEGACY\t" lib "\t" link "\t" target
+                next
+            }
+        }
+        print "UNKNOWN"
+    }
+' "$LINKS_FILE" > "$CLASSIFIED"
+
+UNKNOWN_COUNT=$(grep -c '^UNKNOWN$' "$CLASSIFIED")
+
+declare -A LIB_BROKEN
+CANDIDATES=()   # lib_index|link|reason
+TOTAL_BROKEN=0
+while IFS=$'\t' read -r kind lib link detail; do
+    case "$kind" in
+        BROKEN) reason="$detail" ;;
+        LEGACY)
+            # The retired Decypharr mount is a plain directory now; a missing target
+            # resolves instantly. Only a live target keeps the link.
+            host_target="${RSHARED_HOST}${detail#"$RSHARED_CONTAINER"}"
+            [ -e "$host_target" ] && continue
+            reason="legacy-target-gone"
+            ;;
+        *) continue ;;
+    esac
+    TOTAL_BROKEN=$((TOTAL_BROKEN + 1))
+    LIB_BROKEN[$lib]=$(( ${LIB_BROKEN[$lib]:-0} + 1 ))
+    if [ "${LIB_BROKEN[$lib]}" -le "$MAX_BROKEN_PER_LIB" ]; then
+        CANDIDATES+=("$lib|$link|$reason")
+    fi
+done < "$CLASSIFIED"
+
+for i in "${!LIBRARIES[@]}"; do
+    IFS='|' read -r _ LIB_NAME _ <<< "${LIBRARIES[$i]}"
+    log_it ">> $LIB_NAME — Broken: ${LIB_BROKEN[$i]:-0}"
+done
+log_it "SCAN RESULT: $TOTAL_BROKEN broken | $UNKNOWN_COUNT with unrecognised targets (left alone)."
+
+# --- 3.4 CIRCUIT BREAKER ---
+if [ "$DRY_RUN_GLOBAL" = "N" ] && [ "$TOTAL_BROKEN" -gt "$MAX_BROKEN_BEFORE_HALT" ]; then
+    log_it "CRITICAL: $TOTAL_BROKEN broken links exceeds threshold ($MAX_BROKEN_BEFORE_HALT). Sentinel locked."
+    echo "$(date '+%Y-%m-%d %H:%M:%S') — $TOTAL_BROKEN broken links found (threshold $MAX_BROKEN_BEFORE_HALT). Sentinel locked." > "$HOLD_FILE"
+    exit 1
+fi
+
+# --- 3.5 ROLLING 24H TALLY ---
 NOW=$(date +%s)
 VALID_ENTRIES=$(grep -E '^[0-9]+$' "$STATE_DB" | awk -v limit="$((NOW - 86400))" '$1 > limit')
 echo "$VALID_ENTRIES" > "$STATE_DB"
-ROLLING_COUNT=$(echo "$VALID_ENTRIES" | wc -w)
+ROLLING_COUNT=$(echo "$VALID_ENTRIES" | wc -w | tr -d ' ')
 
+# --- 3.6 EXECUTION ---
 processed_this_run=0
 declare -A LIB_SUMMARY
+declare -A AFFECTED     # "lib|item_folder" → 1
 
-# 5. EXECUTION
 for ENTRY in "${CANDIDATES[@]}"; do
-    [ "$processed_this_run" -ge "$DELETES_PER_RUN" ] || [ "$ROLLING_COUNT" -ge "$ROLLING_24H_LIMIT" ] && break
+    IFS='|' read -r lib LINK reason <<< "$ENTRY"
+    IFS='|' read -r LIB_PATH LIB_NAME _ LIB_MODE _ <<< "${LIBRARIES[$lib]}"
 
-    IFS='|' read -r LINK LIB_NAME LIB_KEY LIB_MODE LIB_NOTIFY LIB_ID <<< "$ENTRY"
-
-    if [ "$LIB_MODE" = "LIVE" ] && [ "$DRY_RUN_GLOBAL" = "N" ]; then
-        if rm -f "$LINK"; then
-            # Notify *Arr (DUMB internal instance)
-            CMD_NAME="RescanSeries"; [[ "${LIB_KEY}" == *"RADARR"* ]] && CMD_NAME="RefreshMovie"
-            URL_VAR="${LIB_KEY}_URL"; API_VAR="${LIB_KEY}_API"
-            if [ -n "${!URL_VAR}" ] && [ -n "${!API_VAR}" ]; then
-                curl -s -X POST "${!URL_VAR}/api/v3/command" \
-                    -H "X-Api-Key: ${!API_VAR}" \
-                    -H "Content-Type: application/json" \
-                    -d "{\"name\": \"$CMD_NAME\"}" > /dev/null
-            fi
-
-            # Notify Plex
-            if [ "$LIB_NOTIFY" = "PLEX" ] && [ -n "$LIB_ID" ] && [ -n "$PLEX_TOKEN" ]; then
-                curl -s -G "${PLEX_URL}/library/sections/${LIB_ID}/refresh" \
-                    -d "X-Plex-Token=${PLEX_TOKEN}" > /dev/null
-            elif [ "$LIB_NOTIFY" = "EMBY" ] && [ -n "$EMBY_URL" ]; then
-                curl -s -X POST "${EMBY_URL}/Library/Refresh?api_key=${EMBY_API}" > /dev/null
-            fi
-
-            echo "$NOW" >> "$STATE_DB"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] DELETED [$LIB_NAME]: $LINK" >> "$AUDIT_LOG"
-            LIB_SUMMARY["$LIB_NAME"]=$(( ${LIB_SUMMARY["$LIB_NAME"]:-0} + 1 ))
-            ((processed_this_run++))
-            ((ROLLING_COUNT++))
-        fi
-    else
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] MOCK    [$LIB_NAME]: $LINK" >> "$AUDIT_LOG"
+    if [ "$LIB_MODE" != "LIVE" ] || [ "$DRY_RUN_GLOBAL" != "N" ]; then
+        audit "MOCK    [$LIB_NAME] ($reason): $LINK"
         LIB_SUMMARY["$LIB_NAME"]=$(( ${LIB_SUMMARY["$LIB_NAME"]:-0} + 1 ))
-        ((processed_this_run++))
-        ((ROLLING_COUNT++))
+        continue
+    fi
+
+    if [ "$processed_this_run" -ge "$DELETES_PER_RUN" ] || [ "$ROLLING_COUNT" -ge "$ROLLING_24H_LIMIT" ]; then
+        log_it "PACE: deletion cap reached (run $processed_this_run/$DELETES_PER_RUN, 24h $ROLLING_COUNT/$ROLLING_24H_LIMIT). Rest waits for the next run."
+        break
+    fi
+
+    if rm -f "$LINK"; then
+        echo "$NOW" >> "$STATE_DB"
+        audit "DELETED [$LIB_NAME] ($reason): $LINK"
+        LIB_SUMMARY["$LIB_NAME"]=$(( ${LIB_SUMMARY["$LIB_NAME"]:-0} + 1 ))
+        rel="${LINK#"$LIB_PATH"/}"
+        AFFECTED["$lib|$LIB_PATH/${rel%%/*}"]=1
+        processed_this_run=$((processed_this_run + 1))
+        ROLLING_COUNT=$((ROLLING_COUNT + 1))
     fi
 done
 
-# 6. OUTPUT SUMMARY
-echo "------------------------------------------------------------"
-for LIB in "${!LIB_SUMMARY[@]}"; do
-    log_it "[$LIB] Processed: ${LIB_SUMMARY[$LIB]}"
+# --- 3.7 NOTIFY *ARRS + PLEX (once per affected movie/series folder) ---
+HAVE_JQ=false
+command -v jq > /dev/null 2>&1 && HAVE_JQ=true
+declare -A ARR_LIST_FETCHED
+declare -A ARR_GLOBAL_RESCANNED
+
+for key in "${!AFFECTED[@]}"; do
+    lib="${key%%|*}"
+    folder="${key#*|}"
+    IFS='|' read -r _ LIB_NAME LIB_KEY _ LIB_NOTIFY PLEX_SECTION _ <<< "${LIBRARIES[$lib]}"
+    app_folder="${APP_MEDIA_ROOT}${folder#"$HOST_MEDIA_ROOT"}"
+
+    # Plex: scan only the affected folder.
+    if [ "$LIB_NOTIFY" = "PLEX" ] && [ -n "$PLEX_SECTION" ] && [ -n "$PLEX_TOKEN" ]; then
+        curl -s -m 30 -o /dev/null -G "${PLEX_URL}/library/sections/${PLEX_SECTION}/refresh" \
+            --data-urlencode "path=${app_folder}" \
+            --data-urlencode "X-Plex-Token=${PLEX_TOKEN}"
+    fi
+
+    URL_VAR="${LIB_KEY}_URL"; API_VAR="${LIB_KEY}_API"
+    ARR_URL="${!URL_VAR}"; ARR_API="${!API_VAR}"
+    [ -z "$ARR_URL" ] || [ -z "$ARR_API" ] && continue
+
+    if [[ "$LIB_KEY" == *RADARR* ]]; then
+        RES="movie"; RESCAN="RescanMovie"; ID_FIELD="movieId"; SEARCH="MoviesSearch"; SEARCH_FIELD="movieIds"
+    else
+        RES="series"; RESCAN="RescanSeries"; ID_FIELD="seriesId"; SEARCH="SeriesSearch"; SEARCH_FIELD="seriesId"
+    fi
+
+    item_id=""
+    if [ "$HAVE_JQ" = "true" ]; then
+        list="$TMP_DIR/arr_${lib}.json"
+        if [ -z "${ARR_LIST_FETCHED[$lib]}" ]; then
+            curl -s -m 120 -H "X-Api-Key: $ARR_API" "$ARR_URL/api/v3/$RES" > "$list" 2>/dev/null
+            ARR_LIST_FETCHED[$lib]=1
+        fi
+        item_id=$(jq -r --arg p "$app_folder" '.[]? | select(.path == $p) | .id' "$list" 2>/dev/null | head -1)
+    fi
+
+    if [ -n "$item_id" ]; then
+        arr_post "$ARR_URL" "$ARR_API" "{\"name\":\"$RESCAN\",\"$ID_FIELD\":$item_id}"
+        if [ "$SEARCH_AFTER_DELETE" = "Y" ]; then
+            if [ "$SEARCH_FIELD" = "movieIds" ]; then
+                arr_post "$ARR_URL" "$ARR_API" "{\"name\":\"$SEARCH\",\"movieIds\":[$item_id]}"
+            else
+                arr_post "$ARR_URL" "$ARR_API" "{\"name\":\"$SEARCH\",\"seriesId\":$item_id}"
+            fi
+        fi
+        audit "NOTIFY  [$LIB_NAME] $RESCAN id=$item_id ($app_folder)"
+    elif [ -z "${ARR_GLOBAL_RESCANNED[$lib]}" ]; then
+        # No jq, or the folder isn't in the *Arr: fall back to one library-wide disk
+        # rescan (no metadata refresh, no search).
+        arr_post "$ARR_URL" "$ARR_API" "{\"name\":\"$RESCAN\"}"
+        ARR_GLOBAL_RESCANNED[$lib]=1
+        audit "NOTIFY  [$LIB_NAME] $RESCAN (library-wide; $([ "$HAVE_JQ" = "true" ] && echo "no match for $app_folder" || echo "jq not installed"))"
+    fi
 done
 
-log_it "SENTINEL SUMMARY: Processed: $processed_this_run | 24h Tally: $ROLLING_COUNT | Total broken found: $TOTAL_BROKEN_GLOBAL | DEC packs: $DEC_PACK_COUNT | NZB categories: $NZB_CAT_COUNT"
+# --- 3.8 SUMMARY ---
+{
+    echo "LAST_ID_COUNT=$ID_COUNT"
+    echo "LAST_RUN_TS=$NOW"
+    echo "LAST_TOTAL_BROKEN=$TOTAL_BROKEN"
+} > "$META_FILE"
+
+echo "------------------------------------------------------------"
+for LIB in "${!LIB_SUMMARY[@]}"; do
+    log_it "[$LIB] $([ "$DRY_RUN_GLOBAL" = "N" ] && echo Deleted || echo "Would delete"): ${LIB_SUMMARY[$LIB]}"
+done
+log_it "SENTINEL SUMMARY: Deleted: $processed_this_run | 24h Tally: $ROLLING_COUNT | Broken: $TOTAL_BROKEN | Unknown targets: $UNKNOWN_COUNT | InfiniDysk items: $ID_COUNT"
 log_it "Detailed paths recorded in $AUDIT_LOG"
 echo "------------------------------------------------------------"
-rm -f "$PACK_LIST" "$NZB_LIST"
 exit 0

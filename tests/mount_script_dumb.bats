@@ -1,154 +1,213 @@
 #!/usr/bin/env bats
-# Smoke tests for Scripts/Mount Script (DUMB).
-# Each test runs the real script with PATH-mocked docker/sleep/notify/date,
-# sandboxed mount paths, and asserts on the resulting state file + call log.
+# Smoke tests for scripts/unraid/Mount Script (DUMB) — the NzbDAV Heartbeat.
+# Each test runs the real script with PATH-mocked docker/curl/sleep/notify/date/
+# mountpoint, a sandboxed mount path, and asserts on the state file + call log.
 
 load helpers/setup
 load helpers/asserts
 
+STATE() { echo "$BATS_TEST_TMPDIR/prime_state.db"; }
+
 setup() {
     init_mocks
     prepare_mount_script
-    # Default time anchor; tests override per-scenario.
     export MOCK_NOW=1700000000
-}
-
-# Pre-populate the sandboxed Decypharr mount with the marker files the
-# script's check probes for.
-make_dec_healthy() {
-    mkdir -p "$BATS_TEST_TMPDIR/dec/__all__"
-    touch "$BATS_TEST_TMPDIR/dec/version.txt"
-}
-
-make_dec_unhealthy() {
-    rm -rf "$BATS_TEST_TMPDIR/dec/__all__" "$BATS_TEST_TMPDIR/dec/version.txt"
-    mkdir -p "$BATS_TEST_TMPDIR/dec"
-}
-
-make_nzb_healthy() {
     mkdir -p "$BATS_TEST_TMPDIR/nzb/completed-symlinks"
 }
 
-@test "happy path: both mounts up, no recovery, state-file written cleanly" {
-    make_nzb_healthy
-    make_dec_healthy
+nzb_up()   { mock_mountpoint "$BATS_TEST_TMPDIR/nzb" yes; }
+nzb_down() { mock_mountpoint "$BATS_TEST_TMPDIR/nzb" no; }
 
-    run bash "$PREPARED_SCRIPT"
-    [ "$status" -eq 0 ]
-
-    assert_not_called "docker restart DUMB-2026"
-    assert_not_called "docker stop DUMB-2026"
-    assert_state_key "$BATS_TEST_TMPDIR/prime_state.db" D_FAIL_COUNT 0
-    assert_state_key "$BATS_TEST_TMPDIR/prime_state.db" N_FAIL_COUNT 0
-    assert_output_contains "Passed: NzbDAV is UP."
-    assert_output_contains "Passed: Decypharr is UP."
+# Mount reads "no" for the initial probe attempts, then "yes" for good.
+nzb_down_then_up() {
+    nzb_up
+    local seq="$MOCK_DIR/mountpoint_$(echo "$BATS_TEST_TMPDIR/nzb" | tr '/' '_').seq"
+    printf 'no\nno\nno\n' > "$seq"
 }
 
-@test "decypharr down with no prior cooldown: recovery fires once, D_FAIL_COUNT=1" {
-    make_nzb_healthy
-    make_dec_unhealthy
+enable_api() {
+    patch_var "$PREPARED_SCRIPT" DUMB_API_USERNAME "admin"
+    patch_var "$PREPARED_SCRIPT" DUMB_API_PASSWORD "secret"
+    echo '{"access_token":"tok123","refresh_token":"r","token_type":"bearer"}' > "$MOCK_DIR/login.json"
+    printf 'auth/login\t200\t%s\nrestart-service\t200\t\n' "$MOCK_DIR/login.json" > "$MOCK_DIR/curl_rules"
+}
 
-    # No state file → DEC_LAST_RECOVERY_TS and FOUNDATION_LAST_RESTART_TS
-    # default to 0, so cooldown gate is open.
+@test "happy path: mount up, no recovery, state UP with zero failures" {
+    nzb_up
+
     run bash "$PREPARED_SCRIPT"
     [ "$status" -eq 0 ]
+
+    assert_not_called "docker restart"
+    assert_not_called "docker stop"
+    assert_not_called "restart-service"
+    assert_state_key "$(STATE)" N_FAIL_COUNT 0
+    assert_state_key "$(STATE)" NZB_STATE UP
+    assert_output_contains "Passed: NzbDAV is UP"
+}
+
+@test "no Decypharr: a v1 state file with Decypharr keys is read and dropped" {
+    nzb_up
+    write_state "$(STATE)" "D_FAIL_COUNT=4" 'DEC_STATE="DOWN"' "TOTAL_LMP_PRIMED=500938" 'NZB_STATE="UP"'
+
+    run bash "$PREPARED_SCRIPT"
+    [ "$status" -eq 0 ]
+
+    assert_not_called "docker restart"
+    ! grep -q 'D_FAIL_COUNT\|DEC_STATE\|TOTAL_LMP_PRIMED' "$(STATE)"
+}
+
+@test "mount down, no API credentials: container restart, failure counted" {
+    nzb_down
+
+    run bash "$PREPARED_SCRIPT"
+    [ "$status" -eq 1 ]
 
     assert_called "docker restart DUMB-2026" 1
-    assert_state_key "$BATS_TEST_TMPDIR/prime_state.db" D_FAIL_COUNT 1
-    assert_state_key "$BATS_TEST_TMPDIR/prime_state.db" DEC_LAST_RECOVERY_TS "$MOCK_NOW"
-    assert_output_contains "Entering Recovery..."
-    assert_output_contains "[!] CRITICAL: Decypharr recovery failed."
+    assert_not_called "auth/login"
+    assert_state_key "$(STATE)" N_FAIL_COUNT 1
+    assert_state_key "$(STATE)" NZB_STATE DOWN
+    assert_state_key "$(STATE)" LAST_RECOVERY_ACTION container
+    assert_state_key "$(STATE)" FOUNDATION_LAST_RESTART_TS "$MOCK_NOW"
+    assert_called "notify -e Rclone Heartbeat -s Mount Down" 2
 }
 
-@test "decypharr down within cooldown: skip restart, D_FAIL_COUNT unchanged" {
-    make_nzb_healthy
-    make_dec_unhealthy
-
-    # Pretend recovery happened 5 minutes ago. Cooldown is 900s, so 600s
-    # remain. Pre-existing D_FAIL_COUNT must NOT be incremented by the
-    # cooldown branch (post-review fix).
-    write_state "$BATS_TEST_TMPDIR/prime_state.db" \
-        "DEC_LAST_RECOVERY_TS=$((MOCK_NOW - 300))" \
-        "D_FAIL_COUNT=2" \
-        "N_FAIL_COUNT=0"
-
-    run bash "$PREPARED_SCRIPT"
-    [ "$status" -eq 0 ]
-
-    assert_not_called "docker restart DUMB-2026"
-    assert_state_key "$BATS_TEST_TMPDIR/prime_state.db" D_FAIL_COUNT 2
-    assert_output_contains "COOLDOWN: Skipping Decypharr restart"
-}
-
-@test "decypharr recovers after cooldown elapses: D_FAIL_COUNT resets to 0" {
-    make_nzb_healthy
-    make_dec_unhealthy
-
-    write_state "$BATS_TEST_TMPDIR/prime_state.db" \
-        "DEC_LAST_RECOVERY_TS=$((MOCK_NOW - 1000))" \
-        "D_FAIL_COUNT=2" \
-        "N_FAIL_COUNT=0"
-
-    # Arrange: the post-restart probe loop will see Decypharr healthy on
-    # the next iteration. We can't easily make the mock filesystem flip
-    # mid-script, but we don't need to — staging healthy markers BEFORE
-    # the run means the FIRST check passes and recovery isn't attempted.
-    # To exercise "recovery succeeds", flip Decypharr healthy AFTER the
-    # initial-probe failure window. Simplest: stage healthy now and rely
-    # on the initial check passing (D_FAIL_COUNT still resets via line 235).
-    make_dec_healthy
-
-    run bash "$PREPARED_SCRIPT"
-    [ "$status" -eq 0 ]
-
-    assert_not_called "docker restart DUMB-2026"
-    assert_state_key "$BATS_TEST_TMPDIR/prime_state.db" D_FAIL_COUNT 0
-    assert_output_contains "Passed: Decypharr is UP."
-}
-
-@test "D_FAIL_COUNT escalation: reaches MAX_FAILURES, nuclear path triggers" {
-    make_nzb_healthy
-    make_dec_unhealthy
-
-    # Pre-load D_FAIL_COUNT=4. With cooldown elapsed, this run will
-    # attempt a real recovery that fails → D_FAIL_COUNT becomes 5 →
-    # nuclear junction fires.
-    write_state "$BATS_TEST_TMPDIR/prime_state.db" \
-        "DEC_LAST_RECOVERY_TS=$((MOCK_NOW - 1000))" \
-        "FOUNDATION_LAST_RESTART_TS=$((MOCK_NOW - 1000))" \
-        "D_FAIL_COUNT=4" \
-        "N_FAIL_COUNT=0"
+@test "mount comes back after container restart: failures reset, state UP" {
+    nzb_down_then_up
+    write_state "$(STATE)" "N_FAIL_COUNT=2" 'NZB_STATE="DOWN"'
 
     run bash "$PREPARED_SCRIPT"
     [ "$status" -eq 0 ]
 
     assert_called "docker restart DUMB-2026" 1
+    assert_state_key "$(STATE)" N_FAIL_COUNT 0
+    assert_state_key "$(STATE)" NZB_STATE UP
+    assert_called "notify -e Rclone Heartbeat -s Mount Restored" 1
+}
+
+@test "container cooldown: recent restart blocks another, failure not counted" {
+    nzb_down
+    write_state "$(STATE)" "FOUNDATION_LAST_RESTART_TS=$((MOCK_NOW - 300))" "N_FAIL_COUNT=2"
+
+    run bash "$PREPARED_SCRIPT"
+    [ "$status" -eq 1 ]
+
+    assert_not_called "docker restart"
+    assert_state_key "$(STATE)" N_FAIL_COUNT 2
+    assert_output_contains "COOLDOWN"
+}
+
+@test "API rung 1: first failure restarts only the rclone process" {
+    nzb_down_then_up
+    enable_api
+
+    run bash "$PREPARED_SCRIPT"
+    [ "$status" -eq 0 ]
+
+    assert_called "auth/login" 1
+    assert_called '"process_name":"rclone w/ InfiniDysk"' 1
+    assert_called '"process_name":"InfiniDysk"' 0
+    assert_called "Authorization: Bearer tok123" 1
+    assert_not_called "docker restart"
+    assert_state_key "$(STATE)" N_FAIL_COUNT 0
+}
+
+@test "API rung 2: second failure restarts InfiniDysk then rclone" {
+    nzb_down
+    enable_api
+    write_state "$(STATE)" "N_FAIL_COUNT=1" 'NZB_STATE="DOWN"'
+
+    run bash "$PREPARED_SCRIPT"
+    [ "$status" -eq 1 ]
+
+    assert_called '"process_name":"InfiniDysk"' 1
+    assert_called '"process_name":"rclone w/ InfiniDysk"' 1
+    # InfiniDysk must be restarted before rclone.
+    grep -n 'restart-service' "$MOCK_CALL_LOG" | head -1 | grep -q '"process_name":"InfiniDysk"'
+    assert_not_called "docker restart"
+    assert_state_key "$(STATE)" N_FAIL_COUNT 2
+    assert_state_key "$(STATE)" LAST_RECOVERY_ACTION infinidysk
+}
+
+@test "API rung 3: third failure escalates to a container restart" {
+    nzb_down
+    enable_api
+    write_state "$(STATE)" "N_FAIL_COUNT=2" 'NZB_STATE="DOWN"'
+
+    run bash "$PREPARED_SCRIPT"
+    [ "$status" -eq 1 ]
+
+    assert_not_called "restart-service"
+    assert_called "docker restart DUMB-2026" 1
+    assert_state_key "$(STATE)" N_FAIL_COUNT 3
+}
+
+@test "API login failure falls back to a container restart" {
+    nzb_down
+    patch_var "$PREPARED_SCRIPT" DUMB_API_USERNAME "admin"
+    patch_var "$PREPARED_SCRIPT" DUMB_API_PASSWORD "wrong"
+    printf 'auth/login\t401\t\n' > "$MOCK_DIR/curl_rules"
+
+    run bash "$PREPARED_SCRIPT"
+    [ "$status" -eq 1 ]
+
+    assert_called "auth/login" 1
+    assert_not_called "restart-service"
+    assert_called "docker restart DUMB-2026" 1
+    assert_output_contains "login to"
+}
+
+@test "dead backend with a live mount skips straight to restarting InfiniDysk" {
+    nzb_up
+    enable_api
+    patch_var "$PREPARED_SCRIPT" NZB_WEBDAV_URL "http://127.0.0.1:8089/"
+    printf '127.0.0.1:8089\t000\t\nauth/login\t200\t%s\nrestart-service\t200\t\n' "$MOCK_DIR/login.json" > "$MOCK_DIR/curl_rules"
+
+    run bash "$PREPARED_SCRIPT"
+    [ "$status" -eq 1 ]
+
+    assert_called '"process_name":"InfiniDysk"' 1
+    assert_output_contains "backend=false"
+}
+
+@test "MAX_FAILURES reached: hard reset stops and starts the container, counter resets" {
+    nzb_down
+    write_state "$(STATE)" "N_FAIL_COUNT=5" "FOUNDATION_LAST_RESTART_TS=$((MOCK_NOW - 1000))"
+
+    run bash "$PREPARED_SCRIPT"
+    [ "$status" -eq 1 ]
+
     assert_called "docker stop DUMB-2026" 1
     assert_called "docker start DUMB-2026" 1
-    assert_output_contains "NUCLEAR OPTION"
-    assert_state_key "$BATS_TEST_TMPDIR/prime_state.db" D_FAIL_COUNT 0
+    assert_not_called "docker restart"
+    assert_state_key "$(STATE)" N_FAIL_COUNT 0
+    assert_state_key "$(STATE)" LAST_RECOVERY_ACTION hard-reset
+    # Automatic hard reset never wipes the cache.
+    assert_output_contains "HARD RESET"
+    [[ "$output" != *"Wiping rclone VFS cache"* ]]
 }
 
-@test "foundation cold-start anchors cooldown: same-run Decypharr down is deferred" {
-    make_nzb_healthy
-    make_dec_unhealthy
+@test "foundation cold start anchors the cooldown: no second restart in the same run" {
+    nzb_down
+    printf 'false\ntrue\n' > "$MOCK_DIR/docker_inspect_DUMB-2026.seq"
 
-    # First docker-inspect call (Section 2.3 foundation check) returns
-    # "false" → triggers `docker start DUMB-2026` and stamps
-    # FOUNDATION_LAST_RESTART_TS. Subsequent inspects return "true" so
-    # NzbDAV/Decypharr patience loops actually probe the (sandboxed)
-    # mount filesystem instead of bypassing on a dead container.
-    printf "false\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n" > "$MOCK_DIR/docker_inspect_DUMB-2026.seq"
+    run bash "$PREPARED_SCRIPT"
+    [ "$status" -eq 1 ]
+
+    assert_called "docker start DUMB-2026" 1
+    assert_not_called "docker restart"
+    assert_state_key "$(STATE)" FOUNDATION_LAST_RESTART_TS "$MOCK_NOW"
+    assert_output_contains "COOLDOWN"
+}
+
+@test "backup in progress: run is skipped entirely" {
+    nzb_down
+    touch "$BATS_TEST_TMPDIR/pause"
+    patch_var "$PREPARED_SCRIPT" BACKUP_PAUSE_FILE "$BATS_TEST_TMPDIR/pause"
 
     run bash "$PREPARED_SCRIPT"
     [ "$status" -eq 0 ]
 
-    assert_called "docker start DUMB-2026" 1
-    # FOUNDATION_LAST_RESTART_TS must be persisted to state file.
-    assert_state_key "$BATS_TEST_TMPDIR/prime_state.db" FOUNDATION_LAST_RESTART_TS "$MOCK_NOW"
-    # Because foundation just restarted (LAST_RESTART = MOCK_NOW), the
-    # Decypharr-down branch must hit the cooldown skip — NOT a second
-    # docker restart in the same run.
-    assert_not_called "docker restart DUMB-2026"
-    assert_output_contains "COOLDOWN: Skipping Decypharr restart"
+    assert_not_called "docker"
+    assert_output_contains "[PAUSED]"
 }

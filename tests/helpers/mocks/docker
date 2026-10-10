@@ -8,7 +8,7 @@ case "$1" in
         # docker inspect -f '{{.State.Running}}' <container>
         # docker inspect -f '{{.State.Paused}}' <container>
         # Last positional arg is the container name.
-        name="${@: -1}"
+        name="${*: -1}"
         # Sequenced override: $MOCK_DIR/docker_inspect_<name>.seq is a
         # list of values, one per line, consumed left-to-right.
         # Static override: $MOCK_DIR/docker_inspect_<name> is a single
