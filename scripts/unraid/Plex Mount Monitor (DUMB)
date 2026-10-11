@@ -1,30 +1,37 @@
 #!/bin/bash
 # ======================================================================================
 # SCRIPT: Plex Mount Monitor (DUMB Edition)
-# VERSION: v1.0-DUMB
-# DESCRIPTION: Stops binhex-plex when DUMB-2026's debrid mounts go down, and restarts
-#              it once they recover. Runs every 2 minutes via cron.
+# VERSION: v2.0-DUMB
+# DESCRIPTION: Stops binhex-plex when DUMB-2026's NzbDAV/InfiniDysk mount goes down,
+#              and restarts it once the mount recovers. Runs every 2 minutes via cron.
 #
 # WHY THIS EXISTS: Plex caches stale FUSE handles after a mount drops — it cannot
-# recover on its own and must be container-restarted to re-see the mounts. This script
-# reacts faster (2 min) than the Heartbeat (5 min) without carrying its heavier
-# priming/recovery workload. The two scripts are fully independent: if Heartbeat is
-# mid-recovery, this script naturally sees mounts down → stops Plex → sees mounts up
-# → starts Plex. No cross-script locking needed.
+# recover on its own and must be container-restarted to re-see the mount. This script
+# reacts faster (2 min) than the Heartbeat (5 min). The two scripts are fully
+# independent: if the Heartbeat is mid-recovery, this script sees the mount down →
+# stops Plex → sees it back → restarts Plex. No cross-script locking needed.
 #
-# BOTH MOUNTS GATE PLEX: Either RD (Decypharr) or NzbDAV going down stops Plex,
-# since Plex libraries contain a mix of content from both mounts.
+# DEBOUNCE: Plex is only stopped after DOWN_THRESHOLD consecutive failed probes, so a
+# single slow readdir doesn't take Plex offline.
+#
+# v2.0: NzbDAV-only. Real-Debrid/Decypharr is disabled in DUMB, and gating on it kept
+# Plex stopped permanently.
 # ======================================================================================
 
 # --------------------------------------------------------------------------------------
-# 1. USER CONFIGURATION
+# 1. USER CONFIGURATION (override in dumb.conf — see dumb.conf.example)
 # --------------------------------------------------------------------------------------
 
-PLEX_CONTAINER="binhex-plex"
-RD_MOUNT_PATH="/mnt/user/data/remote/decypharr/realdebrid/__all__"
-NZB_MOUNT_PATH="/mnt/user/data/remote/nzbdav"
-STATE_FILE="/mnt/user/appdata/other/scripts/dumb-2026/plex_mount_state"
-LOG_FILE="/mnt/user/appdata/other/scripts/dumb-2026/plex_monitor.log"
+DUMB_CONF="${DUMB_CONF:-/mnt/user/appdata/other/scripts/dumb-2026/dumb.conf}"
+# shellcheck source=/dev/null
+[ -f "$DUMB_CONF" ] && source "$DUMB_CONF"
+
+PLEX_CONTAINER="${PLEX_CONTAINER:-binhex-plex}"
+NZB_MOUNT="${NZB_MOUNT:-/mnt/user/data/remote/nzbdav}"
+DOWN_THRESHOLD="${DOWN_THRESHOLD:-2}"        # consecutive failed probes before Plex is stopped
+PROBE_TIMEOUT="${PROBE_TIMEOUT:-10}"         # seconds before a hung readdir counts as down
+STATE_FILE="${STATE_FILE:-/mnt/user/appdata/other/scripts/dumb-2026/plex_mount_state}"
+LOG_FILE="${LOG_FILE:-/mnt/user/appdata/other/scripts/dumb-2026/plex_monitor.log}"
 BACKUP_PAUSE_FILE="${BACKUP_PAUSE_FILE:-/tmp/dumb-scripts.pause}"
 BACKUP_PROC_PATTERN="${BACKUP_PROC_PATTERN:-(appdata\.backup|ca\.backup2).*backup\.(php|sh)}"
 BACKUP_PAUSE_MAX_AGE_MIN="${BACKUP_PAUSE_MAX_AGE_MIN:-120}"
@@ -59,45 +66,78 @@ notify() {
     /usr/local/emhttp/webGui/scripts/notify -e "DUMB Mount Monitor" -s "$1" -d "$2" -i "${3:-normal}" 2>/dev/null
 }
 
-is_mounted() {
-    find "$1" -maxdepth 1 -mindepth 1 -print -quit 2>/dev/null | grep -q .
+# Up = it is a mountpoint AND one readdir answers within PROBE_TIMEOUT.
+# A dead rclone leaves the mountpoint in place but readdir fails ("Transport endpoint
+# is not connected") or hangs — the timeout catches both.
+nzb_up() {
+    timeout "$PROBE_TIMEOUT" mountpoint -q "$NZB_MOUNT" || return 1
+    timeout "$PROBE_TIMEOUT" find "$NZB_MOUNT" -maxdepth 1 -mindepth 1 -print -quit 2>/dev/null | grep -q .
 }
 
 plex_running() {
-    docker inspect -f '{{.State.Running}}' "$PLEX_CONTAINER" 2>/dev/null
+    [ "$(docker inspect -f '{{.State.Running}}' "$PLEX_CONTAINER" 2>/dev/null)" = "true" ]
 }
 
-# Check mounts
-RD_UP=false
-NZB_UP=false
-is_mounted "$RD_MOUNT_PATH" && RD_UP=true
-is_mounted "$NZB_MOUNT_PATH" && NZB_UP=true
-
-# Both mounts must be up — either going down stops Plex
-($RD_UP && $NZB_UP) && CURRENT="up" || CURRENT="down"
-PREVIOUS=$(cat "$STATE_FILE" 2>/dev/null || echo "up")
-
-log "RD: $RD_UP | NZB: $NZB_UP | State: $CURRENT (was: $PREVIOUS)"
-
-if [ "$CURRENT" = "down" ] && [ "$PREVIOUS" = "up" ]; then
-    log "Mounts down — stopping Plex"
-    docker stop "$PLEX_CONTAINER" >> "$LOG_FILE" 2>&1
-    notify "Plex Stopped" "Debrid mounts went down. RD: $RD_UP | NZB: $NZB_UP. Plex stopped." "alert"
-
-elif [ "$CURRENT" = "down" ] && [ "$PREVIOUS" = "down" ]; then
-    log "Mounts still down — keeping Plex stopped"
-    if [ "$(plex_running)" = "true" ]; then
-        log "Plex running but mounts down — stopping"
-        docker stop "$PLEX_CONTAINER" >> "$LOG_FILE" 2>&1
-    fi
-
-elif [ "$CURRENT" = "up" ] && [ "$PREVIOUS" = "down" ]; then
-    log "Mounts recovered — starting Plex"
-    docker start "$PLEX_CONTAINER" >> "$LOG_FILE" 2>&1
-    notify "Plex Restored" "Debrid mounts recovered. RD: $RD_UP | NZB: $NZB_UP. Plex started." "normal"
-
-else
-    log "Mounts healthy — RD: $RD_UP | NZB: $NZB_UP"
+# State file: PLEX_STATE=up|down, FAIL_STREAK=n. A v1 file (bare "up"/"down", written
+# while the RD gate was broken) is ignored so the first v2 run doesn't restart Plex.
+PREVIOUS="up"
+FAIL_STREAK=0
+if grep -q '^PLEX_STATE=' "$STATE_FILE" 2>/dev/null; then
+    PREVIOUS=$(grep '^PLEX_STATE=' "$STATE_FILE" | cut -d= -f2)
+    FAIL_STREAK=$(grep '^FAIL_STREAK=' "$STATE_FILE" | cut -d= -f2)
+    FAIL_STREAK=${FAIL_STREAK:-0}
 fi
 
-echo "$CURRENT" > "$STATE_FILE"
+if nzb_up; then
+    NZB_UP=true
+    FAIL_STREAK=0
+else
+    NZB_UP=false
+    FAIL_STREAK=$((FAIL_STREAK + 1))
+fi
+
+CURRENT="$PREVIOUS"
+if [ "$NZB_UP" = "true" ]; then
+    CURRENT="up"
+elif [ "$FAIL_STREAK" -ge "$DOWN_THRESHOLD" ]; then
+    CURRENT="down"
+fi
+
+log "NZB: $NZB_UP | Fail streak: $FAIL_STREAK/$DOWN_THRESHOLD | State: $CURRENT (was: $PREVIOUS)"
+
+if [ "$CURRENT" = "down" ] && [ "$PREVIOUS" = "up" ]; then
+    log "Mount down — stopping Plex"
+    docker stop "$PLEX_CONTAINER" >> "$LOG_FILE" 2>&1
+    notify "Plex Stopped" "NzbDAV mount at $NZB_MOUNT failed $FAIL_STREAK consecutive checks. Plex stopped." "alert"
+
+elif [ "$CURRENT" = "down" ]; then
+    if plex_running; then
+        log "Mount still down but Plex is running — stopping"
+        docker stop "$PLEX_CONTAINER" >> "$LOG_FILE" 2>&1
+    else
+        log "Mount still down — keeping Plex stopped"
+    fi
+
+elif [ "$PREVIOUS" = "down" ]; then
+    # Restart rather than start: if someone started Plex by hand while the mount was
+    # down, it is holding stale FUSE handles and needs a fresh process.
+    if plex_running; then
+        log "Mount recovered — restarting Plex to drop stale FUSE handles"
+        docker restart "$PLEX_CONTAINER" >> "$LOG_FILE" 2>&1
+    else
+        log "Mount recovered — starting Plex"
+        docker start "$PLEX_CONTAINER" >> "$LOG_FILE" 2>&1
+    fi
+    notify "Plex Restored" "NzbDAV mount recovered. Plex (re)started." "normal"
+
+elif [ "$NZB_UP" = "false" ]; then
+    log "Probe failed — waiting for $DOWN_THRESHOLD consecutive failures before stopping Plex"
+
+else
+    log "Mount healthy"
+fi
+
+{
+    echo "PLEX_STATE=$CURRENT"
+    echo "FAIL_STREAK=$FAIL_STREAK"
+} > "$STATE_FILE"

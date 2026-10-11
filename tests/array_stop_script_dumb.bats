@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Smoke tests for Scripts/Array Stop Script (DUMB).
+# Smoke tests for scripts/unraid/Array Stop Script (DUMB).
 
 load helpers/setup
 load helpers/asserts
@@ -43,4 +43,23 @@ setup() {
     assert_not_called "docker stop -t 90 DUMB-2026"
     assert_output_contains "INFO: $BATS_TEST_TMPDIR/rshared is not mounted. Skipping."
     assert_output_contains "INFO: No other containers running."
+}
+
+@test "stale FUSE mounts under the bind are lazily unmounted, deepest first" {
+    echo "false" > "$MOCK_DIR/docker_inspect_DUMB-2026"
+    : > "$MOCK_DIR/docker_ps"
+    cat > "$BATS_TEST_TMPDIR/proc_mounts" <<MOUNTS
+shfs /mnt/user fuse.shfs rw 0 0
+rclone $BATS_TEST_TMPDIR/rshared/nzbdav fuse.rclone rw 0 0
+dfs $BATS_TEST_TMPDIR/rshared/decypharr/realdebrid fuse.decypharr rw 0 0
+MOUNTS
+
+    run bash "$PREPARED_SCRIPT"
+    [ "$status" -eq 0 ]
+
+    assert_called "umount -l $BATS_TEST_TMPDIR/rshared/nzbdav" 1
+    assert_called "umount -l $BATS_TEST_TMPDIR/rshared/decypharr/realdebrid" 1
+    assert_not_called "umount -l /mnt/user"
+    # Depth sort puts the deeper decypharr/realdebrid path before nzbdav.
+    grep 'umount -l' "$MOCK_CALL_LOG" | head -1 | grep -q decypharr
 }

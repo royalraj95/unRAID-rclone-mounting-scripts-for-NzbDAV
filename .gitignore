@@ -1,4 +1,12 @@
 .DS_Store
 CLAUDE.md
-Scripts/_local-private/
+.claude/settings.local.json
+
+# Credentialed local copies — never commit
+scripts/_local-private/
+dumb.conf
+
+# Personal one-off *Arr queue tools (hold live API keys)
+radarr/
+sonarr/
 clear_sonarr_queue.sh

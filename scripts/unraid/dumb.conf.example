@@ -1,0 +1,57 @@
+# ======================================================================================
+# dumb.conf — shared settings for the DUMB Edition User Scripts
+# ======================================================================================
+# Every (DUMB) script sources this file before applying its own defaults, so the
+# scripts pasted into the User Scripts plugin stay identical to the repo copies and
+# all host-specific values and secrets live here, in one place.
+#
+# Install:
+#   mkdir -p /mnt/user/appdata/other/scripts/dumb-2026
+#   cp dumb.conf.example /mnt/user/appdata/other/scripts/dumb-2026/dumb.conf
+#   chmod 600 /mnt/user/appdata/other/scripts/dumb-2026/dumb.conf
+#
+# Anything left commented out falls back to the default shown next to it.
+# Point a script at a different file with DUMB_CONF=/path/to/file.
+# ======================================================================================
+
+# --- HOST & CONTAINERS ---
+# DUMB_CONTAINER="DUMB-2026"
+# PLEX_CONTAINER="binhex-plex"
+# ENABLERS="binhex-prowlarr"                 # started by the Heartbeat if found down
+
+# --- NZBDAV / INFINIDYSK MOUNT (host side) ---
+# NZB_MOUNT="/mnt/user/data/remote/nzbdav"
+# NZB_WEBDAV_URL="http://127.0.0.1:8089/"    # InfiniDysk backend; any HTTP reply = alive. Empty = skip.
+
+# --- DUMB API (optional) ---
+# With credentials set, the Heartbeat restarts only the rclone / InfiniDysk process
+# instead of bouncing the whole container (Postgres, all four *Arrs, Traefik...).
+# Leave empty to fall back to `docker restart`.
+DUMB_API_URL="http://127.0.0.1:3005/api"
+DUMB_API_USERNAME=""
+DUMB_API_PASSWORD=""
+# DUMB_RCLONE_PROCESS="rclone w/ InfiniDysk"  # must match DUMB's /process/processes exactly
+# DUMB_NZB_PROCESS="InfiniDysk"
+
+# --- INFINIDYSK DATABASE (Sentinel ground truth, read-only) ---
+# INFINIDYSK_DB="/mnt/user/appdata/DUMB-2026/data/nzbdav/db.sqlite"
+
+# --- PATH TRANSLATION ---
+# Host media root ↔ the path the *Arrs and Plex see inside their containers.
+# HOST_MEDIA_ROOT="/mnt/user/data/media"
+# APP_MEDIA_ROOT="/data/media"
+
+# --- PLEX ---
+PLEX_URL="http://127.0.0.1:32400"
+PLEX_TOKEN=""                                # Plex → any item → Get Info → View XML → X-Plex-Token
+
+# --- DUMB INTERNAL *ARRS (used by the Sentinel) ---
+# API keys: each app's WebUI → Settings → General → API Key.
+SONARR_HD_URL="http://127.0.0.1:8992"
+SONARR_HD_API=""
+SONARR_4K_URL="http://127.0.0.1:8993"
+SONARR_4K_API=""
+RADARR_HD_URL="http://127.0.0.1:7879"
+RADARR_HD_API=""
+RADARR_4K_URL="http://127.0.0.1:7883"
+RADARR_4K_API=""

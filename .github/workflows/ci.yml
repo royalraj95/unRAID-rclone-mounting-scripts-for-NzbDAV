@@ -12,19 +12,19 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install shellcheck
         run: sudo apt-get install -y shellcheck
-      - name: Run shellcheck on DUMB scripts
+      - name: Run shellcheck on DUMB scripts and test mocks
         run: |
-          shopt -s extglob
-          shellcheck --severity=warning "Scripts/Mount Script (DUMB)" \
-                                       "Scripts/Symlink Cleanup (DUMB)" \
-                                       "Scripts/Plex Mount Monitor (DUMB)" \
-                                       "Scripts/Array Stop Script (DUMB)"
+          shellcheck --severity=warning "scripts/unraid/Mount Script (DUMB)" \
+                                       "scripts/unraid/Symlink Cleanup (DUMB)" \
+                                       "scripts/unraid/Plex Mount Monitor (DUMB)" \
+                                       "scripts/unraid/Array Stop Script (DUMB)" \
+                                       tests/helpers/mocks/*
 
   bats:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install bats
-        run: sudo apt-get install -y bats
+      - name: Install bats, sqlite3 and jq
+        run: sudo apt-get install -y bats sqlite3 jq
       - name: Run bats tests
         run: bats tests/

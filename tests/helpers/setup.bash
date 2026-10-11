@@ -3,7 +3,7 @@
 # Initializes the mock environment, PATH, and provides script-prep helpers.
 
 REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
-SCRIPTS_DIR="$REPO_ROOT/Scripts"
+SCRIPTS_DIR="$REPO_ROOT/scripts/unraid"
 MOCKS_DIR="$BATS_TEST_DIRNAME/helpers/mocks"
 
 # Each test gets its own MOCK_DIR (canned responses) and MOCK_CALL_LOG
@@ -14,6 +14,8 @@ init_mocks() {
     export MOCK_CALL_LOG="$BATS_TEST_TMPDIR/calls.log"
     mkdir -p "$MOCK_DIR"
     : > "$MOCK_CALL_LOG"
+    # Never pick up a real dumb.conf from the machine running the tests.
+    export DUMB_CONF="$BATS_TEST_TMPDIR/no-such-dumb.conf"
     # Mocks must come first so they shadow real binaries.
     export PATH="$MOCKS_DIR:$PATH"
 }
@@ -34,21 +36,25 @@ prepare_mount_script() {
     patch_var "$PREPARED_SCRIPT" STATE_FILE       "$BATS_TEST_TMPDIR/prime_state.db"
     patch_var "$PREPARED_SCRIPT" LOG_FILE         "$BATS_TEST_TMPDIR/heartbeat.log"
     patch_var "$PREPARED_SCRIPT" NZB_MOUNT        "$BATS_TEST_TMPDIR/nzb"
-    patch_var "$PREPARED_SCRIPT" DEC_MOUNT        "$BATS_TEST_TMPDIR/dec"
-    patch_var "$PREPARED_SCRIPT" LOCAL_MEDIA_PATH "$BATS_TEST_TMPDIR/media"
+    patch_var "$PREPARED_SCRIPT" NZB_WEBDAV_URL   ""
     patch_var "$PREPARED_SCRIPT" RCLONE_CACHE_DIR "$BATS_TEST_TMPDIR/rclone-cache"
     # Rewrite the absolute notify path to the mock.
     sed -i "s|/usr/local/emhttp/webGui/scripts/notify|$MOCKS_DIR/notify|g" "$PREPARED_SCRIPT"
-    mkdir -p "$BATS_TEST_TMPDIR/media"
+}
+
+# Mark a sandboxed path as a live mountpoint for the mountpoint mock.
+mock_mountpoint() {
+    local key
+    key="mountpoint_$(echo "$1" | tr '/' '_')"
+    echo "${2:-yes}" > "$MOCK_DIR/$key"
 }
 
 prepare_plex_monitor_script() {
     PREPARED_SCRIPT="$BATS_TEST_TMPDIR/plex_monitor"
     cp "$SCRIPTS_DIR/Plex Mount Monitor (DUMB)" "$PREPARED_SCRIPT"
-    patch_var "$PREPARED_SCRIPT" STATE_FILE     "$BATS_TEST_TMPDIR/plex_state"
-    patch_var "$PREPARED_SCRIPT" LOG_FILE       "$BATS_TEST_TMPDIR/plex.log"
-    patch_var "$PREPARED_SCRIPT" RD_MOUNT_PATH  "$BATS_TEST_TMPDIR/rd_all"
-    patch_var "$PREPARED_SCRIPT" NZB_MOUNT_PATH "$BATS_TEST_TMPDIR/nzb"
+    patch_var "$PREPARED_SCRIPT" STATE_FILE "$BATS_TEST_TMPDIR/plex_state"
+    patch_var "$PREPARED_SCRIPT" LOG_FILE   "$BATS_TEST_TMPDIR/plex.log"
+    patch_var "$PREPARED_SCRIPT" NZB_MOUNT  "$BATS_TEST_TMPDIR/nzb"
     sed -i "s|/usr/local/emhttp/webGui/scripts/notify|$MOCKS_DIR/notify|g" "$PREPARED_SCRIPT"
 }
 
@@ -58,25 +64,25 @@ prepare_array_stop_script() {
     patch_var "$PREPARED_SCRIPT" LOG_FILE     "$BATS_TEST_TMPDIR/shutdown.log"
     patch_var "$PREPARED_SCRIPT" LOCK_DIR     "$BATS_TEST_TMPDIR/locks"
     patch_var "$PREPARED_SCRIPT" RSHARED_BIND "$BATS_TEST_TMPDIR/rshared"
+    patch_var "$PREPARED_SCRIPT" MOUNTS_FILE  "$BATS_TEST_TMPDIR/proc_mounts"
     sed -i "s|/usr/local/emhttp/webGui/scripts/notify|$MOCKS_DIR/notify|g" "$PREPARED_SCRIPT"
     mkdir -p "$BATS_TEST_TMPDIR/locks"
+    : > "$BATS_TEST_TMPDIR/proc_mounts"
 }
 
 prepare_symlink_cleanup_script() {
     PREPARED_SCRIPT="$BATS_TEST_TMPDIR/symlink_cleanup"
     cp "$SCRIPTS_DIR/Symlink Cleanup (DUMB)" "$PREPARED_SCRIPT"
-    patch_var "$PREPARED_SCRIPT" STATE_DB             "$BATS_TEST_TMPDIR/sentinel_state.db"
-    patch_var "$PREPARED_SCRIPT" AUDIT_LOG            "$BATS_TEST_TMPDIR/sentinel_audit.log"
-    patch_var "$PREPARED_SCRIPT" HOLD_FILE            "$BATS_TEST_TMPDIR/SENTINEL_HOLD.txt"
-    patch_var "$PREPARED_SCRIPT" PRIME_STATE          "$BATS_TEST_TMPDIR/prime_state.db"
-    patch_var "$PREPARED_SCRIPT" RSHARED_HOST         "$BATS_TEST_TMPDIR/rshared"
-    patch_var "$PREPARED_SCRIPT" RSHARED_CONTAINER    "/mnt/debrid"
-    # Drop maturity gate and pack-sanity floor for tests.
-    patch_var "$PREPARED_SCRIPT" UPTIME_MATURITY_REQUIRED 0
-    patch_var "$PREPARED_SCRIPT" MIN_PACKS_SANITY    1
-    # Replace the production LIBRARIES array with a single sandboxed
-    # entry. Tests populate $BATS_TEST_TMPDIR/library with symlinks.
-    awk -v lib="$BATS_TEST_TMPDIR/library" '
+    patch_var "$PREPARED_SCRIPT" STATE_DB        "$BATS_TEST_TMPDIR/sentinel_state.db"
+    patch_var "$PREPARED_SCRIPT" META_FILE       "$BATS_TEST_TMPDIR/sentinel_meta"
+    patch_var "$PREPARED_SCRIPT" AUDIT_LOG       "$BATS_TEST_TMPDIR/sentinel_audit.log"
+    patch_var "$PREPARED_SCRIPT" HOLD_FILE       "$BATS_TEST_TMPDIR/SENTINEL_HOLD.txt"
+    patch_var "$PREPARED_SCRIPT" INFINIDYSK_DB   "$BATS_TEST_TMPDIR/db.sqlite"
+    patch_var "$PREPARED_SCRIPT" RSHARED_HOST    "$BATS_TEST_TMPDIR/rshared"
+    patch_var "$PREPARED_SCRIPT" HOST_MEDIA_ROOT "$BATS_TEST_TMPDIR/media"
+    patch_var "$PREPARED_SCRIPT" MIN_IDS         1
+    # Replace the production LIBRARIES array with one sandboxed TV library.
+    awk -v lib="$BATS_TEST_TMPDIR/media/library" '
         /^LIBRARIES=\(/ {
             print
             print "    \"" lib "|Test|SONARR_HD|LIVE|PLEX|99|3|4\""
@@ -87,9 +93,9 @@ prepare_symlink_cleanup_script() {
         { print }
     ' "$PREPARED_SCRIPT" > "$PREPARED_SCRIPT.new"
     mv "$PREPARED_SCRIPT.new" "$PREPARED_SCRIPT"
-    # Pre-create the indexed mount dirs the pre-scan touches.
-    mkdir -p "$BATS_TEST_TMPDIR/rshared/decypharr/realdebrid/__all__"
-    mkdir -p "$BATS_TEST_TMPDIR/rshared/nzbdav/completed-symlinks"
+    mkdir -p "$BATS_TEST_TMPDIR/media/library" "$BATS_TEST_TMPDIR/rshared"
+    # Minimal InfiniDysk DB: the Sentinel only reads DavItems.Id.
+    sqlite3 "$BATS_TEST_TMPDIR/db.sqlite" 'CREATE TABLE DavItems ("Id" TEXT NOT NULL PRIMARY KEY);'
 }
 
 # Helper: write a state-file value (pre-existing state for the test).

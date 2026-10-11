@@ -1,4 +1,41 @@
 #!/bin/bash
-# Mock for `curl`. Records the call and exits 0. No response body.
+# Mock for `curl`. Records the call. Canned responses come from
+# $MOCK_DIR/curl_rules, one rule per line, tab-separated:
+#   <substring of the args>  <http_code>  <path to body file, or empty>
+# The first rule whose substring appears in the args wins. With no match
+# the response is HTTP 200 with an empty body. The body goes to -o <file>
+# when given, else stdout; `-w '%{http_code}'` prints the code.
 echo "curl $*" >> "$MOCK_CALL_LOG"
+
+out=""
+fmt=""
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+    case "${args[$i]}" in
+        -o) out="${args[$((i + 1))]}" ;;
+        -w) fmt="${args[$((i + 1))]}" ;;
+    esac
+done
+
+code=200
+body=""
+if [ -f "$MOCK_DIR/curl_rules" ]; then
+    while IFS=$'\t' read -r pattern rule_code rule_body; do
+        [ -z "$pattern" ] && continue
+        if [[ "$*" == *"$pattern"* ]]; then
+            code="$rule_code"
+            body="$rule_body"
+            break
+        fi
+    done < "$MOCK_DIR/curl_rules"
+fi
+
+if [ -n "$body" ] && [ -f "$body" ]; then
+    if [ -n "$out" ] && [ "$out" != "-" ]; then
+        cat "$body" > "$out"
+    else
+        cat "$body"
+    fi
+fi
+[[ "$fmt" == *http_code* ]] && printf '%s' "$code"
 exit 0
